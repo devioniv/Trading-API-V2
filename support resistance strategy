@@ -1,0 +1,219 @@
+import argparse
+import datetime
+import logging
+import time
+
+import pandas as pd
+
+from ibapi import wrapper
+from ibapi.client import EClient
+from ibapi.common import BarData
+from ibapi.contract import Contract
+from ibapi.order import Order
+from ibapi.utils import iswrapper
+
+from ContractSamples import ContractSamples
+from OrderSamples import OrderSamples
+from trendline_automation import fit_trendlines_single
+from trendline_breakout import trendline_breakout
+
+
+class TrendlineBreakoutStrategy(wrapper.EWrapper, EClient):
+    def __init__(self, symbol, lookback, quantity):
+        EClient.__init__(self, self)
+        # Strategy parameters
+        self.symbol = symbol
+        self.lookback = lookback
+        self.quantity = quantity
+        
+        # IBKR connection and state
+        self.nextValidOrderId = None
+        self.started = False
+        self.historical_data = []
+        self.data_df = None
+        self.contract = None
+        self.hist_req_id = 1  # A unique ID for our historical data request
+        self.current_position = 0  # 0 = flat, 1 = long, -1 = short
+        self.orders = {} # To store orderId -> order object
+
+    def nextOrderId(self):
+        oid = self.nextValidOrderId
+        self.nextValidOrderId += 1
+        return oid
+
+    @iswrapper
+    def nextValidId(self, orderId: int):
+        super().nextValidId(orderId)
+        self.nextValidOrderId = orderId
+        print("NextValidId:", orderId)
+        # Wait for connection to be fully established before starting
+        if not self.started:
+            self.start()
+
+    def start(self):
+        if self.started:
+            return
+        self.started = True
+        print("Strategy started.")
+        self.request_historical_data()
+
+    def request_historical_data(self):
+        self.contract = ContractSamples.USStock()
+        self.contract.symbol = self.symbol
+        
+        # Request 200 days of daily data to have enough for lookback periods
+        queryTime = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H:%M:%S")
+        self.reqHistoricalData(self.hist_req_id, self.contract, queryTime,
+                               "200 D", "1 day", "TRADES", 1, 1, False, [])
+        print(f"Requesting historical data for {self.contract.symbol}...")
+
+    @iswrapper
+    def historicalData(self, reqId: int, bar: BarData):
+        if reqId == self.hist_req_id:
+            self.historical_data.append({
+                "date": bar.date,
+                "open": bar.open,
+                "high": bar.high,
+                "low": bar.low,
+                "close": bar.close,
+                "volume": bar.volume
+            })
+
+    @iswrapper
+    def historicalDataEnd(self, reqId: int, start: str, end: str):
+        if reqId == self.hist_req_id:
+            print("Historical data download finished.")
+            self.data_df = pd.DataFrame(self.historical_data)
+            self.data_df['date'] = pd.to_datetime(self.data_df['date'], format='%Y%m%d')
+            self.data_df.set_index('date', inplace=True)
+            print("Historical data loaded into DataFrame:")
+            print(self.data_df.tail())
+            
+            # Once data is loaded, run the strategy logic
+            self.run_strategy_logic()
+
+    def run_strategy_logic(self):
+        if self.data_df is None:
+            print("No data to analyze.")
+            self.stop()
+            return
+
+        print("\nRunning trendline analysis...")
+        lookback = self.lookback  # Use parameter
+
+        if len(self.data_df) < lookback:
+            print(f"Not enough data for lookback period. Need {lookback}, have {len(self.data_df)}.")
+            self.stop()
+            return
+
+        close_prices = self.data_df['close'].to_numpy()
+        
+        # Get the support, resistance, and signal arrays
+        support, resist, signal = trendline_breakout(close_prices, lookback)
+        
+        # Get the most recent signal
+        latest_signal = signal[-1]
+        
+        print(f"Latest signal: {latest_signal}")
+        
+        if latest_signal == 1.0 and self.current_position <= 0:
+            print("ACTION: Generate BUY signal.")
+            self.place_trade("BUY", self.quantity)
+        elif latest_signal == -1.0 and self.current_position >= 0:
+            print("ACTION: Generate SELL signal.")
+            self.place_trade("SELL", self.quantity)
+        else:
+            print("ACTION: No signal or already in desired position.")
+            self.stop()
+
+    def place_trade(self, action, quantity):
+        if self.nextValidOrderId is None:
+            print("Cannot place order: nextValidOrderId is not set.")
+            self.stop()
+            return
+            
+        order = OrderSamples.MarketOrder(action, quantity)
+        order_id = self.nextOrderId()
+        
+        self.orders[order_id] = order
+        print(f"Placing {action} order {order_id} for {quantity} shares of {self.contract.symbol}")
+        self.placeOrder(order_id, self.contract, order)
+
+    @iswrapper
+    def openOrder(self, orderId, contract, order, orderState):
+        super().openOrder(orderId, contract, order, orderState)
+        print(f"OpenOrder. PermId: {order.permId}, OrderId: {orderId}, "
+              f"Action: {order.action}, TotalQty: {order.totalQuantity}, Status: {orderState.status}")
+
+    @iswrapper
+    def orderStatus(self, orderId, status, filled, remaining, avgFillPrice, permId, parentId, lastFillPrice, clientId, whyHeld, mktCapPrice):
+        super().orderStatus(orderId, status, filled, remaining, avgFillPrice, permId, parentId, lastFillPrice, clientId, whyHeld, mktCapPrice)
+        print(f"OrderStatus. Id: {orderId}, Status: {status}, Filled: {filled}, "
+              f"Remaining: {remaining}, AvgFillPrice: {avgFillPrice}")
+
+        if status == 'Filled':
+            if orderId in self.orders:
+                action = self.orders[orderId].action
+                if action == "BUY":
+                    self.current_position = 1
+                    print("Position updated to LONG")
+                elif action == "SELL":
+                    self.current_position = -1
+                    print("Position updated to SHORT")
+                del self.orders[orderId]
+            # Stop the app after a fill for this example
+            self.stop()
+        
+    def stop(self):
+        print("Strategy stopped.")
+        if self.isConnected():
+            self.disconnect()
+
+    @iswrapper
+    def error(self, reqId, errorCode, errorString, advancedOrderRejectJson=""):
+        super().error(reqId, errorCode, errorString, advancedOrderRejectJson)
+        # Ignore pacing violation errors
+        if errorCode == 162 and "pacing violation" in errorString:
+            return
+        print(f"Error: reqId={reqId}, errorCode={errorCode}, errorString='{errorString}'")
+        if advancedOrderRejectJson:
+            print(f"AdvancedOrderRejectJson: {advancedOrderRejectJson}")
+
+
+def main():
+    # Set up logging
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+    # Parse command-line arguments
+    cmdLineParser = argparse.ArgumentParser("Trendline Breakout Strategy")
+    cmdLineParser.add_argument("--symbol", default="SPY", help="The stock symbol to trade.")
+    cmdLineParser.add_argument("--lookback", type=int, default=72, help="The lookback period for trendline analysis.")
+    cmdLineParser.add_argument("--quantity", type=int, default=10, help="The number of shares to trade.")
+    cmdLineParser.add_argument("--ip", default="127.0.0.1", help="The IP address of the TWS/Gateway.")
+    cmdLineParser.add_argument("-p", "--port", action="store", type=int,
+                               dest="port", default=7496, help="The TCP port to use")
+    cmdLineParser.add_argument("--clientId", type=int, default=1, help="The client ID for the connection.")
+    args = cmdLineParser.parse_args()
+
+    print("Starting strategy with parameters:")
+    print(f"Symbol: {args.symbol}, Lookback: {args.lookback}, Quantity: {args.quantity}")
+
+    app = TrendlineBreakoutStrategy(symbol=args.symbol, lookback=args.lookback, quantity=args.quantity)
+    try:
+        # Connect to IBKR TWS or Gateway
+        app.connect(args.ip, args.port, clientId=args.clientId)
+        print(f"Connecting to {args.ip}:{args.port} with clientId {args.clientId}...")
+
+        # Run the event loop
+        app.run()
+    except Exception as e:
+        print(f"An error occurred: {e}")
+    finally:
+        # Disconnect on exit
+        if app.isConnected():
+            app.stop()
+        print("Disconnected from IBKR.")
+
+
+if __name__ == "__main__":
+    main()

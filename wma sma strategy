@@ -1,0 +1,68 @@
+"""
+This file contains the logic for a trading strategy based on the
+WMA (20), SMA (20), and MACD (8, 13, 7) indicators.
+"""
+import pandas as pd
+import pandas_ta as ta
+
+def calculate_indicators(data: pd.DataFrame):
+    """
+    Calculates the WMA, SMA, and MACD indicators for the given data.
+
+    Args:
+        data: A pandas DataFrame with a 'close' column.
+
+    Returns:
+        A pandas DataFrame with the calculated indicators.
+    """
+    data.ta.wma(length=20, append=True)
+    data.ta.sma(length=20, append=True)
+    data.ta.macd(fast=8, slow=13, signal=7, append=True)
+    return data
+
+def generate_signals(data: pd.DataFrame):
+    """
+    Generates trading signals based on the calculated indicators.
+
+    Args:
+        data: A pandas DataFrame with the WMA, SMA, and MACD indicators.
+
+    Returns:
+        A pandas DataFrame with a 'signal' column.
+    """
+    data['signal'] = 0.0
+    # The first signal is 0 because there's no previous signal to carry forward.
+    # We start the loop from the second row.
+    for i in range(1, len(data)):
+        # Buy Signal
+        if data['WMA_20'].iloc[i] > data['SMA_20'].iloc[i] and data['MACD_8_13_7'].iloc[i] > data['MACDs_8_13_7'].iloc[i]:
+            data.loc[data.index[i], 'signal'] = 1.0
+        # Sell Signal
+        elif data['WMA_20'].iloc[i] < data['SMA_20'].iloc[i] and data['MACD_8_13_7'].iloc[i] < data['MACDs_8_13_7'].iloc[i]:
+            data.loc[data.index[i], 'signal'] = -1.0
+        # No change in signal
+        else:
+            data.loc[data.index[i], 'signal'] = data['signal'].iloc[i-1]
+    return data
+
+if __name__ == '__main__':
+    # Create a more substantial sample DataFrame for testing
+    close_prices = [
+        100, 101, 102, 103, 104, 105, 106, 107, 108, 109,
+        110, 109, 108, 107, 106, 105, 104, 103, 102, 101,
+        100, 101, 102, 103, 104, 105, 106, 107, 108, 109,
+        110, 111, 112, 113, 114, 115, 116, 117, 118, 119
+    ]
+    dates = pd.to_datetime(pd.date_range(start='2023-01-01', periods=len(close_prices)))
+    data = {'close': close_prices}
+    df = pd.DataFrame(data, index=dates)
+
+
+    # Calculate indicators
+    indicators = calculate_indicators(df)
+
+    # Generate signals
+    signals = generate_signals(indicators)
+
+    # Print the last 20 rows to inspect the results
+    print(signals.tail(20))

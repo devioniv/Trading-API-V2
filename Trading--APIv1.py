@@ -62,7 +62,7 @@ class TradingApp:
         self.status_bar.pack(side=tk.BOTTOM, fill=tk.X)
 
     def connect_ib(self):
-        asyncio.create_task(self._connect_ib())
+        self.connect_task = asyncio.create_task(self._connect_ib())
 
     async def _connect_ib(self):
         try:
@@ -234,7 +234,7 @@ class TradingApp:
         if not symbol or symbol in self.instruments:
             return
         
-        asyncio.create_task(self._add_instrument(symbol))
+        self.add_instrument_task = asyncio.create_task(self._add_instrument(symbol))
 
     async def _add_instrument(self, symbol):
         sec_type = self.sec_type_selector.get()
@@ -243,12 +243,11 @@ class TradingApp:
         elif sec_type == "CASH":
             contract = Forex(symbol)
         elif sec_type == "CRYPTO":
-            if len(symbol) > 3:
+            if symbol.endswith('USD'):
                 crypto_symbol = symbol[:-3]
-                currency = symbol[-3:]
-                contract = Crypto(crypto_symbol, 'PAXOS', currency)
+                contract = Crypto(crypto_symbol, 'PAXOS', 'USD')
             else:
-                self.log(f"Invalid crypto symbol: {symbol}. Please use the format like 'BTCUSD'.")
+                self.log(f"Invalid crypto symbol: {symbol}. Please use the format 'BTCUSD', 'ETHUSD', etc.")
                 return
         elif sec_type == "FUT":
             expiry = self.expiry_entry.get()
@@ -273,7 +272,6 @@ class TradingApp:
                 self.strategy_instrument_selector['values'] = list(self.instruments.keys())
                 self.log(f"Added instrument: {symbol}")
                 await self.fetch_historical_data(symbol)
-                self.start_realtime_updates(symbol)
             else:
                 self.log(f"Could not qualify contract for {symbol}")
         except Exception as e:
@@ -286,11 +284,10 @@ class TradingApp:
         
         symbol = self.instrument_listbox.get(selection[0])
         
-        rt_bars = self.realtime_bars.get(symbol)
-        if rt_bars:
-            self.ib.cancelRealTimeBars(rt_bars)
-            del self.realtime_bars[symbol]
-        
+        bar_data_list = self.data.get(symbol)
+        if bar_data_list:
+            self.ib.cancelHistoricalData(bar_data_list)
+
         del self.instruments[symbol]
         if symbol in self.data:
             del self.data[symbol]
@@ -304,7 +301,6 @@ class TradingApp:
         if not contract:
             return
 
-        # Fetch 1 day of 1-minute bars
         what_to_show = 'TRADES'
         if contract.secType == 'CRYPTO':
             what_to_show = 'AGGTRADES'
@@ -315,50 +311,27 @@ class TradingApp:
             contract,
             endDateTime='',
             durationStr='1 D',
-            barSizeSetting='1 min',
+            barSizeSetting='5 mins',
             whatToShow=what_to_show,
             useRTH=True,
-            formatDate=1
+            formatDate=1,
+            keepUpToDate=True
         )
         if bars:
-            df = util.df(bars)
-            self.data[symbol] = df
+            self.data[symbol] = bars
+            bars.updateEvent += self.on_bar_update
             self.log(f"Fetched {len(bars)} historical bars for {symbol}")
-            self.start_realtime_updates(symbol)
         else:
             self.log(f"Could not fetch historical data for {symbol}")
-
-    def start_realtime_updates(self, symbol):
-        contract = self.instruments.get(symbol)
-        if not contract:
-            return
-        
-        rt_bars = self.ib.reqRealTimeBars(contract, 5, 'TRADES', False, [])
-        self.realtime_bars[symbol] = rt_bars
-        rt_bars.updateEvent += self.on_bar_update
 
     def on_bar_update(self, bars, has_new_bar):
         if has_new_bar:
             symbol = bars.contract.symbol
-            df = self.data.get(symbol)
-            if df is not None:
-                bar_data = {
-                    'date': pd.to_datetime(bars[-1].time),
-                    'open': bars[-1].open_,
-                    'high': bars[-1].high,
-                    'low': bars[-1].low,
-                    'close': bars[-1].close,
-                    'volume': bars[-1].volume,
-                    'average': bars[-1].wap,
-                    'barCount': bars[-1].count
-                }
-                new_row = pd.DataFrame([bar_data]).set_index('date')
-                self.data[symbol] = pd.concat([df, new_row])
-                self.log(f"New bar for {symbol}: {bars[-1]}")
+            self.log(f"New 5-minute bar for {symbol}: {bars[-1]}")
 
-                if symbol in self.strategies:
-                    for strategy in self.strategies[symbol]:
-                        strategy.run()
+            if symbol in self.strategies:
+                for strategy in self.strategies[symbol]:
+                    strategy.run()
     
     def save_strategies(self):
         symbol = self.strategy_instrument_selector.get()
@@ -396,7 +369,7 @@ class TradingApp:
 def main():
     util.patchAsyncio()
     root = tk.Tk()
-    app = TradingApp(root)
+    TradingApp(root)
 
     async def run_tk():
         try:
@@ -431,22 +404,22 @@ class SmaWmaCrossoverStrategy(Strategy):
         if self.data is None or len(self.data) < self.long_period:
             return
 
-        # Calculate SMAs
-        self.data['short_sma'] = self.data['close'].rolling(window=self.short_period).mean()
-        self.data['long_sma'] = self.data['close'].rolling(window=self.long_period).mean()
+        df = util.df(self.data)
+        df['short_sma'] = df['close'].rolling(window=self.short_period).mean()
+        df['long_sma'] = df['close'].rolling(window=self.long_period).mean()
 
         # Check for crossover
-        if len(self.data) > self.long_period:
+        if len(df) > self.long_period:
             # Golden Cross
-            if self.data['short_sma'].iloc[-2] < self.data['long_sma'].iloc[-2] and \
-               self.data['short_sma'].iloc[-1] > self.data['long_sma'].iloc[-1]:
+            if df['short_sma'].iloc[-2] < df['long_sma'].iloc[-2] and \
+               df['short_sma'].iloc[-1] > df['long_sma'].iloc[-1]:
                 order = MarketOrder('BUY', self.quantity)
                 self.ib.placeOrder(self.contract, order)
                 self.app.log(f"Golden Cross for {self.contract.symbol}. Placing BUY order.")
 
             # Death Cross
-            elif self.data['short_sma'].iloc[-2] > self.data['long_sma'].iloc[-2] and \
-                 self.data['short_sma'].iloc[-1] < self.data['long_sma'].iloc[-1]:
+            elif df['short_sma'].iloc[-2] > df['long_sma'].iloc[-2] and \
+                 df['short_sma'].iloc[-1] < df['long_sma'].iloc[-1]:
                 order = MarketOrder('SELL', self.quantity)
                 self.ib.placeOrder(self.contract, order)
                 self.app.log(f"Death Cross for {self.contract.symbol}. Placing SELL order.")
@@ -461,7 +434,8 @@ class TrendlineBreakoutStrategy(Strategy):
         if self.data is None or len(self.data) < self.period:
             return
 
-        recent_data = self.data.tail(self.period)
+        df = util.df(self.data)
+        recent_data = df.tail(self.period)
         highs = recent_data['high']
         lows = recent_data['low']
 
@@ -471,7 +445,7 @@ class TrendlineBreakoutStrategy(Strategy):
         support_slope = (lows.min() - lows.iloc[0]) / self.period
         support_intercept = lows.iloc[0]
 
-        current_price = self.data['close'].iloc[-1]
+        current_price = df['close'].iloc[-1]
         
         # Simplified breakout logic
         resistance_price = resistance_slope * (self.period -1) + resistance_intercept
@@ -497,12 +471,13 @@ class SupportResistanceStrategy(Strategy):
         if self.data is None or len(self.data) < self.period:
             return
 
-        recent_data = self.data.tail(self.period)
+        df = util.df(self.data)
+        recent_data = df.tail(self.period)
         support_level = recent_data['low'].min()
         resistance_level = recent_data['high'].max()
 
-        current_price = self.data['close'].iloc[-1]
-        current_open = self.data['open'].iloc[-1]
+        current_price = df['close'].iloc[-1]
+        current_open = df['open'].iloc[-1]
         
         # Check for bounce from support
         if abs(current_price - support_level) < (support_level * 0.01): # Within 1% of support

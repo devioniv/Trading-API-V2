@@ -3,6 +3,7 @@ import tkinter as tk
 from tkinter import ttk
 from ib_async import IB, util, Stock, Forex, Future, Option, Crypto, MarketOrder
 import pandas as pd
+import pandas_ta as ta
 
 class TradingApp:
     def __init__(self, root):
@@ -205,11 +206,46 @@ class TradingApp:
         sr_frame.grid(row=3, column=0, columnspan=2, padx=5, pady=5, sticky=tk.EW)
         self.sr_enabled = tk.BooleanVar()
         ttk.Checkbutton(sr_frame, text="Enable", variable=self.sr_enabled).grid(row=0, column=0, sticky=tk.W)
+        
+        # Fair Value Gap Strategy
+        fvg_frame = ttk.LabelFrame(frame, text="Fair Value Gap (FVG)", padding="10")
+        fvg_frame.grid(row=1, column=2, rowspan=4, columnspan=2, padx=5, pady=5, sticky=tk.NSEW)
+        self.fvg_enabled = tk.BooleanVar()
+        ttk.Checkbutton(fvg_frame, text="Enable", variable=self.fvg_enabled).grid(row=0, column=0, sticky=tk.W, columnspan=2)
+
+        ttk.Label(fvg_frame, text="Min Gap Size:").grid(row=1, column=0, sticky=tk.W)
+        self.fvg_min_gap_size = ttk.Entry(fvg_frame, width=7)
+        self.fvg_min_gap_size.grid(row=1, column=1, sticky=tk.W)
+        self.fvg_min_gap_size.insert(0, "0.1")
+
+        ttk.Label(fvg_frame, text="Max Candles:").grid(row=2, column=0, sticky=tk.W)
+        self.fvg_max_candles = ttk.Entry(fvg_frame, width=7)
+        self.fvg_max_candles.grid(row=2, column=1, sticky=tk.W)
+        self.fvg_max_candles.insert(0, "10")
+
+        ttk.Label(fvg_frame, text="S/R Lookback:").grid(row=3, column=0, sticky=tk.W)
+        self.fvg_support_lookback = ttk.Entry(fvg_frame, width=7)
+        self.fvg_support_lookback.grid(row=3, column=1, sticky=tk.W)
+        self.fvg_support_lookback.insert(0, "10")
+        
+        self.fvg_use_sr = tk.BooleanVar(value=True)
+        ttk.Checkbutton(fvg_frame, text="Use S/R", variable=self.fvg_use_sr).grid(row=4, column=0, sticky=tk.W)
+        
+        self.fvg_use_bos = tk.BooleanVar(value=True)
+        ttk.Checkbutton(fvg_frame, text="Use BOS", variable=self.fvg_use_bos).grid(row=4, column=1, sticky=tk.W)
+
+        self.fvg_use_regime = tk.BooleanVar(value=False)
+        ttk.Checkbutton(fvg_frame, text="Use Regime Filter", variable=self.fvg_use_regime).grid(row=5, column=0, sticky=tk.W)
+
+        self.fvg_use_dynamic_sizing = tk.BooleanVar(value=False)
+        ttk.Checkbutton(fvg_frame, text="Dynamic Sizing", variable=self.fvg_use_dynamic_sizing).grid(row=5, column=1, sticky=tk.W)
+
 
         self.save_strategies_button = ttk.Button(frame, text="Save Strategies", command=self.save_strategies)
-        self.save_strategies_button.grid(row=4, column=0, columnspan=2, pady=10)
+        self.save_strategies_button.grid(row=6, column=0, columnspan=4, pady=10)
         
         frame.grid_columnconfigure(1, weight=1)
+        frame.grid_columnconfigure(3, weight=1)
 
     def create_logs_tab(self):
         frame = ttk.Frame(self.logs_tab, padding="10")
@@ -366,6 +402,24 @@ class TradingApp:
             self.strategies[symbol].append(strategy)
             self.log(f"Support/Resistance strategy enabled for {symbol}")
 
+        if self.fvg_enabled.get():
+            try:
+                fvg_params = {
+                    "quantity": quantity,
+                    "min_gap_size": float(self.fvg_min_gap_size.get()),
+                    "max_candles": int(self.fvg_max_candles.get()),
+                    "support_lookback": int(self.fvg_support_lookback.get()),
+                    "use_support_resistance": self.fvg_use_sr.get(),
+                    "use_break_of_structure": self.fvg_use_bos.get(),
+                    "use_market_regime_filter": self.fvg_use_regime.get(),
+                    "use_dynamic_sizing": self.fvg_use_dynamic_sizing.get()
+                }
+                strategy = FairValueGapStrategy(self, symbol, **fvg_params)
+                self.strategies[symbol].append(strategy)
+                self.log(f"Fair Value Gap strategy enabled for {symbol}")
+            except ValueError as e:
+                self.log(f"Invalid FVG parameter: {e}")
+
 def main():
     util.patchAsyncio()
     root = tk.Tk()
@@ -435,6 +489,9 @@ class TrendlineBreakoutStrategy(Strategy):
             return
 
         df = util.df(self.data)
+        if df is None or len(df) < self.period:
+            return
+            
         recent_data = df.tail(self.period)
         highs = recent_data['high']
         lows = recent_data['low']
@@ -472,6 +529,9 @@ class SupportResistanceStrategy(Strategy):
             return
 
         df = util.df(self.data)
+        if df is None or len(df) < self.period:
+            return
+            
         recent_data = df.tail(self.period)
         support_level = recent_data['low'].min()
         resistance_level = recent_data['high'].max()
@@ -492,6 +552,262 @@ class SupportResistanceStrategy(Strategy):
                 order = MarketOrder('SELL', self.quantity)
                 self.ib.placeOrder(self.contract, order)
                 self.app.log(f"Rejection from resistance for {self.contract.symbol}. Placing SELL order.")
+
+class FairValueGapStrategy(Strategy):
+    def __init__(self, app, symbol, quantity=1, min_gap_size=0.1, max_candles=10, lookback_bos=20,
+                 range_threshold=0.02, lower_threshold=0.02, upper_threshold=0.6,
+                 support_lookback=10, support_tolerance=0.01, support_method="high_low_limit",
+                 use_support_resistance=True, use_break_of_structure=True,
+                 use_market_regime_filter=False, use_allowed_range_filter=True, use_dynamic_sizing=False):
+        super().__init__(app, symbol)
+        self.quantity = quantity
+        self.min_gap_size = min_gap_size
+        self.max_candles = max_candles
+        self.lookback_bos = lookback_bos
+        self.range_threshold = range_threshold
+        self.lower_threshold = lower_threshold
+        self.upper_threshold = upper_threshold
+        self.support_lookback = support_lookback
+        self.support_tolerance = support_tolerance
+        self.support_method = support_method
+        self.use_support_resistance = use_support_resistance
+        self.use_break_of_structure = use_break_of_structure
+        self.use_market_regime_filter = use_market_regime_filter
+        self.use_allowed_range_filter = use_allowed_range_filter
+        self.use_dynamic_sizing = use_dynamic_sizing
+
+        self.active_fvgs = []
+
+    def run(self):
+        if self.data is None or len(self.data) < max(self.lookback_bos, self.support_lookback, 200):
+            return
+
+        df = util.df(self.data)
+        if df is None or len(df) < max(self.lookback_bos, self.support_lookback, 200):
+            return
+        
+        # Calculate necessary indicators and confluences
+        self.calculate_indicators(df)
+
+        # Main loop logic (simplified for single pass on new bar)
+        i = len(df) - 1
+        if i < 2:
+            return
+
+        self.detect_new_fvg(df, i)
+        self.update_active_fvgs(df, i)
+
+    def calculate_indicators(self, df):
+        if df is None:
+            return
+            
+        if self.use_support_resistance:
+            self.calculate_support_resistance(df)
+        if self.use_market_regime_filter:
+            self.detect_market_regime(df)
+        if 'atr' not in df.columns: # Avoid recalculating
+            atr_result = ta.atr(df['high'], df['low'], df['close'], length=14)
+            if atr_result is not None:
+                df['ATR'] = atr_result
+
+    def detect_new_fvg(self, df, i):
+        if df is None or len(df) <= i or i < 2:
+            return
+            
+        high_i2, low_i = df['high'].iloc[i - 2], df['low'].iloc[i]
+        low_i2, high_i = df['low'].iloc[i - 2], df['high'].iloc[i]
+
+        fvg_types = [
+            {"direction": "bullish", "fvg_low": high_i2, "fvg_high": low_i, "gap_size": low_i - high_i2, "threshold": high_i2 < low_i},
+            {"direction": "bearish", "fvg_low": high_i, "fvg_high": low_i2, "gap_size": low_i2 - high_i, "threshold": low_i2 > high_i}
+        ]
+
+        for fvg in fvg_types:
+            if fvg["gap_size"] >= self.min_gap_size and fvg["threshold"]:
+                fvg_dict = {
+                    "start_idx": i, "fvg_low": fvg["fvg_low"], "fvg_high": fvg["fvg_high"],
+                    "zone_tested": False, "validation_candles": 0, "direction": fvg["direction"]
+                }
+                
+                confluence_passed = True
+                if self.use_allowed_range_filter and not self.FVG_is_in_allowed_range(df, fvg["fvg_low"], fvg["fvg_high"], i, direction=fvg["direction"]):
+                    confluence_passed = False
+                
+                bos = self.is_break_of_structure(df, fvg["fvg_low"], fvg["fvg_high"], i, direction=fvg["direction"]) if self.use_break_of_structure else False
+                
+                sr_support = 'on_recent_support' in df.columns and df['on_recent_support'].iloc[i]
+                sr_resistance = 'on_recent_resistance' in df.columns and df['on_recent_resistance'].iloc[i]
+                
+                sr = (sr_support if fvg['direction'] == 'bullish' else sr_resistance) if self.use_support_resistance else False
+
+                if not (bos or sr) and (self.use_break_of_structure or self.use_support_resistance):
+                    confluence_passed = False
+
+                if confluence_passed:
+                    self.active_fvgs.append(fvg_dict)
+
+    def update_active_fvgs(self, df, i):
+        if df is None or len(df) <= i:
+            return
+            
+        current_candle = df.iloc[i]
+        to_remove = []
+
+        for idx, fvg_dict in enumerate(self.active_fvgs):
+            fvg_low, fvg_high, direction = fvg_dict["fvg_low"], fvg_dict["fvg_high"], fvg_dict["direction"]
+
+            if not fvg_dict['zone_tested']:
+                if direction == "bullish" and (current_candle['low'] * (1 - self.support_tolerance) <= fvg_high <= current_candle['high'] * (1 + self.support_tolerance)):
+                    fvg_dict['zone_tested'] = True
+                elif direction == "bearish" and (current_candle['low'] <= fvg_low <= current_candle['high']):
+                    fvg_dict['zone_tested'] = True
+            else:
+                fvg_dict['validation_candles'] += 1
+                if fvg_dict['validation_candles'] >= self.max_candles:
+                    to_remove.append(idx)
+                    continue
+
+                signal = 0
+                if direction == "bullish" and current_candle['close'] > fvg_high:
+                    signal = 1
+                elif direction == "bearish" and current_candle['close'] < fvg_low:
+                    signal = -1
+
+                if self.use_market_regime_filter and 'is_trending' in df.columns and not df['is_trending'].iloc[i]:
+                    signal = 0
+
+                if signal != 0:
+                    quantity = self.determine_position_size(df, i) if self.use_dynamic_sizing else self.quantity
+                    action = 'BUY' if signal == 1 else 'SELL'
+                    order = MarketOrder(action, quantity)
+                    self.ib.placeOrder(self.contract, order)
+                    self.app.log(f"FVG Signal for {self.contract.symbol}. Placing {action} order of {quantity} shares.")
+                    to_remove.append(idx)
+
+        for r_idx in sorted(to_remove, reverse=True):
+            if r_idx < len(self.active_fvgs):
+                self.active_fvgs.pop(r_idx)
+            
+    def calculate_support_resistance(self, df):
+        if df is None or len(df) < self.support_lookback:
+            return
+            
+        if self.support_method == "slope":
+            df['ma'] = df['close'].rolling(window=5).mean()
+            df['slope'] = df['ma'].diff()
+            df['is_support_candle'] = (df['slope'].shift(1) < 0) & (df['slope'] > 0)
+            df['is_resistance_candle'] = (df['slope'].shift(1) > 0) & (df['slope'] < 0)
+        else:
+            n = self.support_lookback
+            df['is_support_candle'] = df['low'] == df['low'].rolling(2*n+1, center=True).min()
+            df['is_resistance_candle'] = df['high'] == df['high'].rolling(2*n+1, center=True).max()
+
+        support_prices = df['low'][df['is_support_candle']]
+        resistance_prices = df['high'][df['is_resistance_candle']]
+
+        # Initialize columns if they don't exist
+        if 'on_recent_support' not in df.columns:
+            df['on_recent_support'] = False
+        if 'on_recent_resistance' not in df.columns:
+            df['on_recent_resistance'] = False
+
+        # Calculate support/resistance using a more efficient approach
+        for idx in range(len(df)):
+            if idx < self.support_lookback:
+                continue
+                
+            current_low = df['low'].iloc[idx]
+            current_high = df['high'].iloc[idx]
+            
+            # Check for support
+            for support_price in support_prices:
+                if support_price < current_low and abs(current_low - support_price) < self.support_tolerance * support_price:
+                    df.loc[df.index[idx], 'on_recent_support'] = True
+                    break
+            
+            # Check for resistance  
+            for resistance_price in resistance_prices:
+                if resistance_price > current_high and abs(current_high - resistance_price) < self.support_tolerance * resistance_price:
+                    df.loc[df.index[idx], 'on_recent_resistance'] = True
+                    break
+
+    def is_break_of_structure(self, df, fvg_low, fvg_high, current_idx, direction="bullish"):
+        if df is None or len(df) <= current_idx:
+            return False
+            
+        start_idx = max(0, current_idx - self.lookback_bos)
+        recent_df = df.iloc[start_idx:current_idx]
+        current_price = df['close'].iloc[current_idx]
+
+        if direction == "bullish":
+            swing_high = recent_df['high'].max()
+            if current_price >= swing_high and (fvg_low >= swing_high or abs(fvg_low - swing_high) <= self.range_threshold * swing_high):
+                return True
+        else:
+            swing_low = recent_df['low'].min()
+            if current_price <= swing_low and (fvg_high <= swing_low or abs(fvg_high - swing_low) <= self.range_threshold * swing_low):
+                return True
+        return False
+
+    def FVG_is_in_allowed_range(self, df, fvg_low, fvg_high, current_idx, lookback=200, direction="bullish"):
+        if df is None or len(df) <= current_idx:
+            return False
+            
+        start_idx = max(0, current_idx - lookback)
+        recent_df = df.iloc[start_idx:current_idx + 1]
+        range_high, range_low = recent_df['high'].max(), recent_df['low'].min()
+        range_height = range_high - range_low
+        if range_height <= 0: 
+            return False
+
+        fvg_midpoint = (fvg_low + fvg_high) / 2
+        fvg_position = (fvg_midpoint - range_low) / range_height
+        
+        return self.lower_threshold <= fvg_position <= self.upper_threshold
+        
+    def detect_market_regime(self, df, ma_length=50, slope_threshold=0.01, atr_length=14, atr_threshold=1.5, adx_length=14, adx_threshold=25):
+        if df is None or len(df) < ma_length:
+            return
+            
+        df['ma'] = df['close'].rolling(window=ma_length).mean()
+        df['ma_slope'] = df['ma'].diff()
+        df['is_strong_bullish_slope'] = df['ma_slope'] > slope_threshold
+        df['is_strong_bearish_slope'] = df['ma_slope'] < -slope_threshold
+        
+        atr = ta.atr(df['high'], df['low'], df['close'], length=atr_length)
+        if atr is not None and not atr.empty:
+            df['ATR'] = atr
+            df['atr_mean'] = df['ATR'].rolling(atr_length).mean()
+            df['high_volatility'] = df['ATR'] > df['atr_mean'] * atr_threshold
+        else:
+            df['high_volatility'] = False
+
+        adx_df = ta.adx(df['high'], df['low'], df['close'], length=adx_length)
+        if adx_df is not None and not adx_df.empty and f'ADX_{adx_length}' in adx_df.columns:
+            df['adx'] = adx_df[f'ADX_{adx_length}']
+            df['strong_adx'] = df['adx'] > adx_threshold
+        else:
+            df['strong_adx'] = False
+
+        df['is_trending'] = (df['is_strong_bullish_slope'] | df['is_strong_bearish_slope']) & df['high_volatility'] & df['strong_adx']
+
+    def determine_position_size(self, df, i):
+        if df is None or len(df) <= i:
+            return self.quantity
+            
+        confluence_score = 0
+        if self.use_support_resistance and 'on_recent_support' in df.columns and (df['on_recent_support'].iloc[i] or df['on_recent_resistance'].iloc[i]):
+            confluence_score += 1
+        if self.use_break_of_structure:
+            is_bos = self.is_break_of_structure(df, df['low'].iloc[i-2], df['high'].iloc[i], i)
+            if is_bos:
+                confluence_score += 1
+        if self.use_market_regime_filter and 'is_trending' in df.columns and df['is_trending'].iloc[i]:
+            confluence_score += 1
+
+        position_sizes = {1: 0.5, 2: 1, 3: 1.5}
+        size_multiplier = position_sizes.get(confluence_score, 0.5)
+        return max(1, int(self.quantity * size_multiplier))
 
 if __name__ == '__main__':
     main()

@@ -109,6 +109,7 @@ class TradingApp(QMainWindow):
         self.data: Dict[str, pd.DataFrame] = {}
         self.strategies: Dict[int, object] = {}
         self.strategy_tasks: Dict[int, asyncio.Task] = {}
+        self.live_bar_subscriptions: Dict[str, object] = {}
         self.next_strategy_id = 1
 
         # signals
@@ -123,8 +124,7 @@ class TradingApp(QMainWindow):
         self.create_widgets()
         self.load_config()
 
-        # Attempt binding to live bar events if IB exposes them — defensive
-        self._bind_live_bar_events()
+        pass
 
     # UI building
     def create_widgets(self):
@@ -141,17 +141,7 @@ class TradingApp(QMainWindow):
         top.addWidget(self.connect_btn)
         top.addWidget(self.disconnect_btn)
 
-        top.addSpacing(12)
-        top.addWidget(QLabel("Global Market Data Type:"))
-        self.global_data_type = QComboBox()
-        for name in DATA_TYPE_MAP:
-            self.global_data_type.addItem(name, DATA_TYPE_MAP[name])
-        top.addWidget(self.global_data_type)
-        self.apply_global_dt_btn = QPushButton("Apply Global DataType")
-        self.apply_global_dt_btn.clicked.connect(self.on_apply_global_data_type)
-        top.addWidget(self.apply_global_dt_btn)
-
-        top.addSpacing(12)
+        top.addStretch()
         top.addWidget(QLabel("Symbol:"))
         self.symbol_entry = QLineEdit()
         self.symbol_entry.setFixedWidth(120)
@@ -210,9 +200,6 @@ class TradingApp(QMainWindow):
         inst_layout.addWidget(self.inst_table)
 
         inst_btns = QHBoxLayout()
-        self.fetch_history_btn = QPushButton("Fetch History (selected rows)")
-        self.fetch_history_btn.clicked.connect(self.on_fetch_history_selected)
-        inst_btns.addWidget(self.fetch_history_btn)
         self.remove_inst_btn = QPushButton("Remove Selected")
         self.remove_inst_btn.clicked.connect(self.on_remove_selected_instruments)
         inst_btns.addWidget(self.remove_inst_btn)
@@ -231,7 +218,7 @@ class TradingApp(QMainWindow):
         top_strat_row.addStretch()
         strat_layout.addLayout(top_strat_row)
 
-        self.strategy_types = ["WMA_SMMA_MACD", "TrendlineBreakout", "SupportResistance", "FairValueGap"]
+        self.strategy_types = ["WMA_RMA_MACD", "TrendlineBreakout", "SupportResistance", "FairValueGap"]
         self.strategy_checkboxes: Dict[str, QCheckBox] = {}
         strat_box = QGroupBox("Available Strategies")
         strat_box_layout = QHBoxLayout()
@@ -248,37 +235,37 @@ class TradingApp(QMainWindow):
         params_group = QGroupBox("Strategy-Specific Parameters")
         params_v_layout = QVBoxLayout()
 
-        # WMA/MACD params
-        wma_macd_box = QGroupBox("WMA_SMMA_MACD")
+        # WMA/RMA/MACD params
+        wma_macd_box = QGroupBox("WMA_RMA_MACD")
         wma_macd_layout = QHBoxLayout()
         wma_macd_layout.addWidget(QLabel("WMA Fast:"))
         self.wma_fast_spin = QSpinBox()
         self.wma_fast_spin.setRange(1, 1000)
-        self.wma_fast_spin.setValue(50)
+        self.wma_fast_spin.setValue(10)
         wma_macd_layout.addWidget(self.wma_fast_spin)
         wma_macd_layout.addSpacing(10)
-        wma_macd_layout.addWidget(QLabel("WMA Slow:"))
-        self.wma_slow_spin = QSpinBox()
-        self.wma_slow_spin.setRange(1, 1000)
-        self.wma_slow_spin.setValue(100)
-        wma_macd_layout.addWidget(self.wma_slow_spin)
+        wma_macd_layout.addWidget(QLabel("RMA Slow:"))
+        self.rma_slow_spin = QSpinBox()
+        self.rma_slow_spin.setRange(1, 1000)
+        self.rma_slow_spin.setValue(20)
+        wma_macd_layout.addWidget(self.rma_slow_spin)
         wma_macd_layout.addSpacing(10)
         wma_macd_layout.addWidget(QLabel("MACD Fast:"))
         self.macd_fast_spin = QSpinBox()
         self.macd_fast_spin.setRange(1, 1000)
-        self.macd_fast_spin.setValue(5)
+        self.macd_fast_spin.setValue(8)
         wma_macd_layout.addWidget(self.macd_fast_spin)
         wma_macd_layout.addSpacing(10)
         wma_macd_layout.addWidget(QLabel("MACD Slow:"))
         self.macd_slow_spin = QSpinBox()
         self.macd_slow_spin.setRange(1, 1000)
-        self.macd_slow_spin.setValue(10)
+        self.macd_slow_spin.setValue(13)
         wma_macd_layout.addWidget(self.macd_slow_spin)
         wma_macd_layout.addSpacing(10)
         wma_macd_layout.addWidget(QLabel("MACD Signal:"))
         self.macd_signal_spin = QSpinBox()
         self.macd_signal_spin.setRange(1, 1000)
-        self.macd_signal_spin.setValue(10)
+        self.macd_signal_spin.setValue(7)
         wma_macd_layout.addWidget(self.macd_signal_spin)
         wma_macd_layout.addStretch()
         wma_macd_box.setLayout(wma_macd_layout)
@@ -652,53 +639,36 @@ class TradingApp(QMainWindow):
         except Exception:
             pass
 
-    # Attempt to bind live bar/historical events (best-effort)
-    def _bind_live_bar_events(self):
-        if not self.ib:
+    def _on_bar_update(self, bars, hasNewBar):
+        """Callback for live bar updates."""
+        if not hasNewBar:
             return
-        # try several possible event names the wrapper might expose
-        event_names = ["historicalDataEvent", "historicalData", "realtimeBarEvent", "barUpdateEvent", "realtimeBarsEvent"]
-        for name in event_names:
-            try:
-                evt = getattr(self.ib, name, None)
-                if evt is not None:
-                    # bind a handler that logs candlestick receptions
-                    evt += self._on_live_bar_event
-                    self.log(f"Bound live bar handler to event: {name}")
-                    break
-            except Exception:
-                pass
 
-    def _on_live_bar_event(self, *args, **kwargs):
-        # The event callback signature varies by wrapper; defensively extract symbol/timeframe if available
         try:
-            sym = None
-            timeframe = "unknown"
-            bar_info = None
-            # common shapes: (reqId, bar) or (contract, bar) or (symbol, bar)
-            if args:
-                for a in args:
-                    if hasattr(a, "symbol"):
-                        sym = getattr(a, "symbol")
-                    if isinstance(a, str):
-                        # sometimes first arg is symbol or reqId
-                        if a.upper() in self.instruments:
-                            sym = a.upper()
-                # last arg may be bar-like
-                bar_info = args[-1]
-            if kwargs and "bar" in kwargs:
-                bar_info = kwargs["bar"]
-            # try to extract datetime
-            dt = None
-            if bar_info is not None:
-                dt = getattr(bar_info, "time", None) or getattr(bar_info, "date", None) or bar_info.get("date", None) if isinstance(bar_info, dict) else None
-            ts = dt if dt is not None else time.strftime("%Y-%m-%d %H:%M:%S")
-            if sym:
-                self.log(f"Candlestick data received for {sym} (live event) at {ts}")
-            else:
-                self.log(f"Candlestick data received (live event) at {ts}")
-        except Exception:
-            pass
+            symbol = bars.contract.symbol
+            df = self.data.get(symbol)
+            if df is None:
+                return
+
+            last_bar = bars[-1]
+            # Create a new row from the bar data
+            # The index should be a datetime object
+            new_row = pd.DataFrame([{
+                "open": last_bar.open,
+                "high": last_bar.high,
+                "low": last_bar.low,
+                "close": last_bar.close,
+                "volume": last_bar.volume,
+            }], index=[pd.to_datetime(last_bar.time)])
+
+            # Append the new row to the existing DataFrame
+            self.data[symbol] = pd.concat([df, new_row])
+
+            self.log(f"Live data update for {symbol}: new 5-second bar received at {last_bar.time}")
+
+        except Exception as e:
+            self.log(f"Error in _on_bar_update: {e}")
+            traceback.print_exc()
 
     # ---- UI callbacks / instrument management ----
     def on_add_instrument(self):
@@ -707,10 +677,13 @@ class TradingApp(QMainWindow):
         if not s:
             QMessageBox.warning(self, "Input", "Enter a symbol.")
             return
-        # assign default data type from global selector
-        dtype = self.global_data_type.currentData()
+
+        # Set data type: 1=Live for CASH, 3=Delayed for others
+        dtype = 1 if sec == "CASH" else 3
+        dtype_map_rev = {v: k for k, v in DATA_TYPE_MAP.items()}
+
         self.instruments[s] = {"symbol": s, "secType": sec, "dataType": dtype}
-        self.log(f"Instrument added: {s} ({sec}), dataType={self.global_data_type.currentText()}")
+        self.log(f"Instrument added: {s} ({sec}), default dataType={dtype_map_rev.get(dtype, 'Unknown')}")
         self.instrument_list_update_signal.emit(list(self.instruments.keys()))
 
     def on_remove_selected_instruments(self):
@@ -730,21 +703,6 @@ class TradingApp(QMainWindow):
                 self.log(f"Removed instruments: {', '.join(removed)}")
         except Exception as e:
             self.log(f"remove selected instruments error: {e}")
-
-    def on_fetch_history_selected(self):
-        try:
-            rows = sorted(set(idx.row() for idx in self.inst_table.selectedIndexes()))
-            if not rows:
-                QMessageBox.information(self, "Select", "Select instrument rows to fetch history.")
-                return
-            for r in rows:
-                item = self.inst_table.item(r, 0)
-                if item:
-                    sym = item.text()
-                    # schedule historical fetch; after fetch we log candlestick confirmation
-                    self.add_task(self._fetch_and_store_historical(sym))
-        except Exception as e:
-            self.log(f"fetch history selected error: {e}")
 
     async def _fetch_and_store_historical(self, symbol: str, duration="1 D", bar_size="5 mins"):
         """
@@ -825,20 +783,6 @@ class TradingApp(QMainWindow):
             traceback.print_exc()
             return None
 
-    # Apply global data type for instruments missing explicit dataType
-    def on_apply_global_data_type(self):
-        try:
-            val = self.global_data_type.currentData()
-            applied = []
-            for sym, info in self.instruments.items():
-                if info.get("dataType", None) is None:
-                    info["dataType"] = val
-                    applied.append(sym)
-            self.instrument_list_update_signal.emit(list(self.instruments.keys()))
-            self.log(f"Applied global data type to: {', '.join(applied) if applied else '<none>'}")
-        except Exception as e:
-            self.log(f"on_apply_global_data_type error: {e}")
-
     # ---- Strategy Manager: select-all behavior ----
     def on_select_all_toggled(self, state):
         checked = state == getattr(Qt, "Checked", Qt.CheckState.Checked)
@@ -873,9 +817,9 @@ class TradingApp(QMainWindow):
                 "interval_seconds": float(self.interval_spin.value()),
                 "auto_trade": bool(self.auto_trade_chk.isChecked()),
 
-                # WMA_SMMA_MACD params
+            # WMA_RMA_MACD params
                 "wma_fast": self.wma_fast_spin.value(),
-                "wma_slow": self.wma_slow_spin.value(),
+            "rma_slow": self.rma_slow_spin.value(),
                 "macd_fast": self.macd_fast_spin.value(),
                 "macd_slow": self.macd_slow_spin.value(),
                 "macd_signal": self.macd_signal_spin.value(),
@@ -921,15 +865,57 @@ class TradingApp(QMainWindow):
                 symbol_list = [sym]
             for sym in symbol_list:
                 for st in checked:
-                    self._create_and_start_strategy(sym, st, params)
+                    self.add_task(self._create_and_start_strategy(sym, st, params))
         except Exception as e:
             self.log(f"on_create_checked_strategies error: {e}")
 
-    def _create_and_start_strategy(self, symbol: str, strat_type: str, params: Dict[str, Any]):
+    async def _subscribe_to_instrument_data(self, symbol: str):
+        """Subscribe to historical and live data for an instrument."""
+        if symbol in self.data:
+            self.log(f"Data for {symbol} already exists. Skipping subscription.")
+            return
+
+        self.log(f"Subscribing to data for {symbol}...")
+        # 1. Fetch historical data
+        await self._fetch_and_store_historical(symbol)
+
+        # 2. Request live data
+        if self.ib and self.ib.isConnected():
+            await self._request_live_bars(symbol)
+
+    async def _request_live_bars(self, symbol: str):
+        """Request real-time 5-second bars for a symbol."""
+        if symbol in self.live_bar_subscriptions:
+            self.log(f"Already subscribed to live bars for {symbol}.")
+            return
+
+        contract_info = self.instruments.get(symbol)
+        if not contract_info:
+            self.log(f"Cannot request live bars, no contract info for {symbol}")
+            return
+
+        sec_type = contract_info.get("secType", "STK").upper()
+        if sec_type == "STK":
+            contract = Stock(symbol, 'SMART', 'USD')
+        elif sec_type == "CASH":
+            contract = Forex(f"{symbol}USD")
+        else:
+            self.log(f"Live data for secType {sec_type} not currently supported.")
+            return
+
+        self.log(f"Requesting real-time bars for {symbol}...")
+        bars = self.ib.reqRealTimeBars(contract, 5, 'TRADES', False)
+        self.live_bar_subscriptions[symbol] = bars
+        bars.updateEvent += self._on_bar_update
+
+    async def _create_and_start_strategy(self, symbol: str, strat_type: str, params: Dict[str, Any]):
         try:
+            # Ensure data is subscribed before starting strategy
+            await self._subscribe_to_instrument_data(symbol)
+
             strategy = None
-            if strat_type == "WMA_SMMA_MACD":
-                strategy = WmaSmmaMacdStrategy(self, symbol, params)
+            if strat_type == "WMA_RMA_MACD":
+                strategy = WmaRmaMacdStrategy(self, symbol, params)
             elif strat_type == "TrendlineBreakout":
                 strategy = TrendlineBreakoutStrategy(self, symbol, params)
             elif strat_type == "SupportResistance":
@@ -1033,19 +1019,14 @@ class TradingApp(QMainWindow):
                 cb = QComboBox()
                 for k in DATA_TYPE_MAP:
                     cb.addItem(k, DATA_TYPE_MAP[k])
-                dtype = info.get("dataType", None)
-                if dtype is None:
-                    # global default index
-                    gv = self.global_data_type.currentData()
-                    for i in range(cb.count()):
-                        if cb.itemData(i) == gv:
-                            cb.setCurrentIndex(i)
-                            break
-                else:
-                    for i in range(cb.count()):
-                        if cb.itemData(i) == dtype:
-                            cb.setCurrentIndex(i)
-                            break
+
+                # The dataType is now guaranteed to be set when an instrument is added.
+                dtype = info.get("dataType")
+                for i in range(cb.count()):
+                    if cb.itemData(i) == dtype:
+                        cb.setCurrentIndex(i)
+                        break
+
                 def make_on_change(sym=s, combobox=cb):
                     def on_change(idx):
                         try:
@@ -1193,21 +1174,21 @@ class BaseStrategy:
     def stop(self):
         self.is_running = False
 
-class WmaSmmaMacdStrategy(BaseStrategy):
+class WmaRmaMacdStrategy(BaseStrategy):
     def __init__(self, app, symbol, params=None):
         super().__init__(app, symbol, params)
-        self.wma_fast = int(self.params.get("wma_fast", 50))
-        self.wma_slow = int(self.params.get("wma_slow", 100))
-        self.macd_fast = int(self.params.get("macd_fast", 5))
-        self.macd_slow = int(self.params.get("macd_slow", 10))
-        self.macd_signal = int(self.params.get("macd_signal", 10))
+        self.wma_fast = int(self.params.get("wma_fast", 10))
+        self.rma_slow = int(self.params.get("rma_slow", 20))
+        self.macd_fast = int(self.params.get("macd_fast", 8))
+        self.macd_slow = int(self.params.get("macd_slow", 13))
+        self.macd_signal = int(self.params.get("macd_signal", 7))
 
     def calculate_indicators(self, df: pd.DataFrame):
         try:
             df.ta.wma(length=self.wma_fast, append=True, col_names=(f'WMA_{self.wma_fast}',))
-            df.ta.wma(length=self.wma_slow, append=True, col_names=(f'WMA_{self.wma_slow}',))
+            df.ta.rma(length=self.rma_slow, append=True, col_names=(f'RMA_{self.rma_slow}',))
         except Exception as e:
-            self.log(f"WMA calculation error: {e}")
+            self.log(f"Indicator calculation error: {e}")
             pass
         try:
             df.ta.macd(fast=self.macd_fast, slow=self.macd_slow, signal=self.macd_signal, append=True)
@@ -1221,20 +1202,20 @@ class WmaSmmaMacdStrategy(BaseStrategy):
             return None
         try:
             price = df['close'].iloc[-1]
-            wf_col = f"WMA_{self.wma_fast}"
-            ws_col = f"WMA_{self.wma_slow}"
-            if wf_col not in df.columns or ws_col not in df.columns or "MACD_hist" not in df.columns:
-                self.log(f"Indicator columns missing: needs {wf_col}, {ws_col}, MACD_hist")
+            wma_col = f"WMA_{self.wma_fast}"
+            rma_col = f"RMA_{self.rma_slow}"
+            if wma_col not in df.columns or rma_col not in df.columns or "MACD_hist" not in df.columns:
+                self.log(f"Indicator columns missing: needs {wma_col}, {rma_col}, MACD_hist")
                 return None
 
-            wv = df[wf_col].iloc[-1]
-            sv = df[ws_col].iloc[-1]
+            wma_val = df[wma_col].iloc[-1]
+            rma_val = df[rma_col].iloc[-1]
             macd_hist = df["MACD_hist"].iloc[-1]
             prev_macd_hist = df["MACD_hist"].iloc[-2]
 
-            if price > wv > sv and macd_hist > 0 and macd_hist > prev_macd_hist:
+            if price > wma_val > rma_val and macd_hist > 0 and macd_hist > prev_macd_hist:
                 return "BUY"
-            if price < wv < sv and macd_hist < 0 and macd_hist < prev_macd_hist:
+            if price < wma_val < rma_val and macd_hist < 0 and macd_hist < prev_macd_hist:
                 return "SELL"
         except Exception as e:
             self.log(f"check_conditions error: {e}")
@@ -1242,7 +1223,7 @@ class WmaSmmaMacdStrategy(BaseStrategy):
 
     async def run(self):
         self.is_running = True
-        self.log("WMA/SMMA+MACD strategy started.")
+        self.log("WMA/RMA+MACD strategy started.")
         try:
             while self.is_running:
                 await asyncio.sleep(self.interval)
@@ -1257,12 +1238,12 @@ class WmaSmmaMacdStrategy(BaseStrategy):
                     if self.auto_trade:
                         await self.place_order(sig, qty)
         except asyncio.CancelledError:
-            self.log("WMA/SMMA+MACD task cancelled.")
+            self.log("WMA/RMA+MACD task cancelled.")
         except Exception as e:
             self.log(f"run error: {e}")
         finally:
             self.is_running = False
-            self.log("WMA/SMMA+MACD strategy stopped.")
+            self.log("WMA/RMA+MACD strategy stopped.")
 
 class TrendlineBreakoutStrategy(BaseStrategy):
     def __init__(self, app, symbol, params=None):

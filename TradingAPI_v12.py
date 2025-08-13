@@ -124,8 +124,6 @@ class TradingApp(QMainWindow):
         self.create_widgets()
         self.load_config()
 
-        pass
-
     # UI building
     def create_widgets(self):
         central = QWidget()
@@ -754,13 +752,21 @@ class TradingApp(QMainWindow):
                 self.log(f"Unsupported secType for historical data fetch: {sec_type}")
                 return None
 
+            # Set parameters based on secType
+            if sec_type == 'CASH':
+                what_to_show = 'MIDPOINT'
+                use_rth = False
+            else:
+                what_to_show = 'TRADES'
+                use_rth = True
+
             bars = await self.ib.reqHistoricalDataAsync(
                 ib_contract,
                 endDateTime='',
                 durationStr=duration,
                 barSizeSetting=bar_size,
-                whatToShow='TRADES',
-                useRTH=True
+                whatToShow=what_to_show,
+                useRTH=use_rth
             )
 
             if not bars:
@@ -1615,7 +1621,7 @@ class FairValueGapStrategy(BaseStrategy):
                                     self.trade_info["stop_order_id"] = stop_order.order.orderId
 
         self.is_running = False
-        self.log("FairValueGap strategy stopped.")
+        self.log("FairValueGap strategy started.")
 
 #---- Run the app ----
 if __name__ == "__main__":

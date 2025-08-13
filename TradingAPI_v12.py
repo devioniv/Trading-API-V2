@@ -18,6 +18,7 @@ except Exception:
     IB = None
     MarketOrder = None
     LimitOrder = None
+    StopOrder = None
     default_rng = None # Ensure it exists for type hinting
 
 import pandas as pd
@@ -204,8 +205,8 @@ class TradingApp(QMainWindow):
         self.inst_table.setHorizontalHeaderLabels(["Symbol", "SecType", "DataType"])
         self._set_header_resize(self.inst_table, 3)
         # allow multi-row selection
-        self.inst_table.setSelectionBehavior(getattr(QAbstractItemView, "SelectRows", QAbstractItemView.SelectItems))
-        self.inst_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.inst_table.setSelectionBehavior(getattr(QAbstractItemView, "SelectRows", QAbstractItemView.SelectionBehavior.SelectRows))
+        self.inst_table.setSelectionMode(getattr(QAbstractItemView, "ExtendedSelection", QAbstractItemView.SelectionMode.ExtendedSelection))
         inst_layout.addWidget(self.inst_table)
 
         inst_btns = QHBoxLayout()
@@ -382,24 +383,24 @@ class TradingApp(QMainWindow):
         fvg_row2_layout.addStretch()
         fvg_layout.addLayout(fvg_row2_layout)
 
-    fvg_row3_layout = QHBoxLayout()
-    self.fvg_dynamic_sizing_chk = QCheckBox("Dynamic Sizing")
-    self.fvg_dynamic_sizing_chk.setChecked(True)
-    fvg_row3_layout.addWidget(self.fvg_dynamic_sizing_chk)
-    self.fvg_partial_tp_chk = QCheckBox("Partial TP")
-    self.fvg_partial_tp_chk.setChecked(True)
-    fvg_row3_layout.addWidget(self.fvg_partial_tp_chk)
-    self.fvg_trailing_stop_chk = QCheckBox("Trailing Stop")
-    self.fvg_trailing_stop_chk.setChecked(True)
-    fvg_row3_layout.addWidget(self.fvg_trailing_stop_chk)
-    fvg_row3_layout.addWidget(QLabel("Trail ATR Mult:"))
-    self.fvg_trail_atr_mult_spin = QDoubleSpinBox()
-    self.fvg_trail_atr_mult_spin.setRange(0.1, 10.0)
-    self.fvg_trail_atr_mult_spin.setSingleStep(0.1)
-    self.fvg_trail_atr_mult_spin.setValue(1.0)
-    fvg_row3_layout.addWidget(self.fvg_trail_atr_mult_spin)
-    fvg_row3_layout.addStretch()
-    fvg_layout.addLayout(fvg_row3_layout)
+        fvg_row3_layout = QHBoxLayout()
+        self.fvg_dynamic_sizing_chk = QCheckBox("Dynamic Sizing")
+        self.fvg_dynamic_sizing_chk.setChecked(True)
+        fvg_row3_layout.addWidget(self.fvg_dynamic_sizing_chk)
+        self.fvg_partial_tp_chk = QCheckBox("Partial TP")
+        self.fvg_partial_tp_chk.setChecked(True)
+        fvg_row3_layout.addWidget(self.fvg_partial_tp_chk)
+        self.fvg_trailing_stop_chk = QCheckBox("Trailing Stop")
+        self.fvg_trailing_stop_chk.setChecked(True)
+        fvg_row3_layout.addWidget(self.fvg_trailing_stop_chk)
+        fvg_row3_layout.addWidget(QLabel("Trail ATR Mult:"))
+        self.fvg_trail_atr_mult_spin = QDoubleSpinBox()
+        self.fvg_trail_atr_mult_spin.setRange(0.1, 10.0)
+        self.fvg_trail_atr_mult_spin.setSingleStep(0.1)
+        self.fvg_trail_atr_mult_spin.setValue(1.0)
+        fvg_row3_layout.addWidget(self.fvg_trail_atr_mult_spin)
+        fvg_row3_layout.addStretch()
+        fvg_layout.addLayout(fvg_row3_layout)
 
         fvg_box.setLayout(fvg_layout)
         params_v_layout.addWidget(fvg_box)
@@ -450,17 +451,13 @@ class TradingApp(QMainWindow):
     def _set_header_resize(self, table: QTableWidget, cols: int):
         try:
             header = table.horizontalHeader()
-            # Try both enum styles to avoid Pylance errors
-            if hasattr(QHeaderView, "Stretch"):
-                mode = QHeaderView.Stretch
-            else:
-                mode = getattr(QHeaderView, "ResizeMode", QHeaderView).Stretch
+            stretch_mode = getattr(QHeaderView, "Stretch", getattr(QHeaderView, "ResizeMode", {}).Stretch)
             for c in range(cols):
-                header.setSectionResizeMode(c, mode)
+                header.setSectionResizeMode(c, stretch_mode)
         except Exception:
             try:
-                # fallback single call
-                table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+                resize_mode = getattr(QHeaderView, "ResizeToContents", getattr(QHeaderView, "ResizeMode", {}).ResizeToContents)
+                table.horizontalHeader().setSectionResizeMode(resize_mode)
             except Exception:
                 pass
 
@@ -772,9 +769,10 @@ class TradingApp(QMainWindow):
                 df['close'] = df['open'] + (rng.standard_normal(n) * 0.03)
                 df.reset_index(inplace=True)
                 df.rename(columns={'index': 'datetime'}, inplace=True)
+                df.set_index('datetime', inplace=True)
                 self.data[symbol] = df
                 normalize_ta_columns(df)
-                last_time = df['datetime'].iloc[-1]
+                last_time = df.index[-1]
                 self.log(f"Candlestick data received for {symbol} (fake) last bar at {last_time}")
                 return df
 
@@ -843,7 +841,7 @@ class TradingApp(QMainWindow):
 
     # ---- Strategy Manager: select-all behavior ----
     def on_select_all_toggled(self, state):
-        checked = state == Qt.Checked
+        checked = state == getattr(Qt, "Checked", Qt.CheckState.Checked)
         try:
             for cb in self.strategy_checkboxes.values():
                 cb.blockSignals(True)
@@ -899,10 +897,10 @@ class TradingApp(QMainWindow):
                 "upper_threshold": self.fvg_upper_thresh_spin.value(),
                 "support_lookback": self.fvg_support_lookback_spin.value(),
                 "support_tolerance": self.fvg_support_tolerance_spin.value(),
-            "fvg_dynamic_sizing": self.fvg_dynamic_sizing_chk.isChecked(),
-            "fvg_partial_tp": self.fvg_partial_tp_chk.isChecked(),
-            "fvg_trailing_stop": self.fvg_trailing_stop_chk.isChecked(),
-            "fvg_trail_atr_mult": self.fvg_trail_atr_mult_spin.value(),
+                "fvg_dynamic_sizing": self.fvg_dynamic_sizing_chk.isChecked(),
+                "fvg_partial_tp": self.fvg_partial_tp_chk.isChecked(),
+                "fvg_trailing_stop": self.fvg_trailing_stop_chk.isChecked(),
+                "fvg_trail_atr_mult": self.fvg_trail_atr_mult_spin.value(),
             }
             apply_to_selected = self.apply_to_selected_chk.isChecked()
             symbol_list: List[str] = []
@@ -1130,10 +1128,10 @@ class BaseStrategy:
     def log(self, msg: str):
         self.app.log(f"[{self.__class__.__name__}:{self.symbol}] {msg}")
 
-    async def place_order(self, action: str, qty: float, order_type: str = "MKT", limit_price: Optional[float] = None):
+    async def place_order(self, action: str, qty: float, order_type: str = "MKT", limit_price: Optional[float] = None, stop_price: Optional[float] = None, order_id: Optional[int] = None):
         try:
-            if self.app.ib is None:
-                self.log("IB not available — skipping order.")
+            if self.app.ib is None or not self.app.ib.isConnected():
+                self.log("IB not available or not connected — skipping order.")
                 return None
             if self.contract is None:
                 self.log("No contract for order.")
@@ -1152,11 +1150,14 @@ class BaseStrategy:
                 order = MarketOrder(action, float(qty))
             elif order_type.upper() == "LMT":
                 order = LimitOrder(action, float(qty), float(limit_price) if limit_price is not None else 0.0)
-            elif order_type.upper() == "STP LMT":
-                order = StopOrder(action, float(qty), float(limit_price) if limit_price is not None else 0.0)
+            elif order_type.upper() == "STP":
+                order = StopOrder(action, float(qty), float(stop_price) if stop_price is not None else 0.0)
             else:
                 self.log(f"Unsupported order type: {order_type}")
                 return None
+
+            if order_id:
+                order.orderId = order_id
 
             self.log(f"Placing order: {action} {qty} {self.symbol} @ {order_type}")
             trade = self.app.ib.placeOrder(ib_contract, order)
@@ -1402,7 +1403,7 @@ class FairValueGapStrategy(BaseStrategy):
             return self.qty
 
         confluence_score = 0
-        if df['on_recent_support'].iloc[i] or df['on_recent_resistance'].iloc[i]:
+        if 'on_recent_support' in df.columns and (df['on_recent_support'].iloc[i] or df['on_recent_resistance'].iloc[i]):
             confluence_score += 1
         if 'BOS' in df.columns and df['BOS'].iloc[i]:
             confluence_score += 1
@@ -1410,7 +1411,27 @@ class FairValueGapStrategy(BaseStrategy):
             confluence_score += 1
 
         position_sizes = {1: 0.2, 2: 0.4, 3: 0.5}
-        return self.app.ib.accountValues()[0].value * position_sizes.get(confluence_score, 0.1)
+        if self.app.ib and self.app.ib.isConnected():
+            account_values = self.app.ib.accountValues()
+            net_liquidation_str = next((v.value for v in account_values if v.tag == 'NetLiquidation' and v.currency == 'USD'), None)
+
+            if net_liquidation_str:
+                try:
+                    net_liquidation = float(net_liquidation_str)
+                    current_price = df['close'].iloc[i]
+                    risk_fraction = position_sizes.get(confluence_score, 0.01) # Default to 1% risk
+
+                    if current_price > 0:
+                        # Allocate a fraction of portfolio based on confluence
+                        dollar_amount = net_liquidation * risk_fraction
+                        return dollar_amount / current_price
+                    else:
+                        self.log("Current price is 0, cannot calculate dynamic size.")
+                except (ValueError, TypeError) as e:
+                    self.log(f"Could not parse NetLiquidation value: {net_liquidation_str}, error: {e}")
+
+        self.log("NetLiquidation value not available, using default qty.")
+        return self.qty
 
     def _calculate_support_resistance(self, df: pd.DataFrame):
         df['is_support_candle'] = (
@@ -1546,24 +1567,27 @@ class FairValueGapStrategy(BaseStrategy):
                 continue
 
             current_price = df['close'].iloc[-1]
-            position = next((p for p in self.app.ib.positions() if p.contract.symbol == self.symbol), None)
+            position = None
+            if self.app.ib and self.app.ib.isConnected():
+                position = next((p for p in self.app.ib.positions() if p.contract.symbol == self.symbol), None)
 
             if self.trade_info and position:
-                # Manage open trade
                 info = self.trade_info
-                if info["partial_taken"] and self.fvg_trailing_stop:
+                if info.get("stop_order_id") and info["partial_taken"] and self.fvg_trailing_stop:
                     atr = df[f"ATR_{self.params.get('atr_length', 14)}"].iloc[-1]
-                    new_sl = 0
-                    if position.position > 0: # Long
-                        new_sl = current_price - self.fvg_trail_atr_mult * atr
-                        if new_sl > info["remaining_position_sl"]:
-                            info["remaining_position_sl"] = new_sl
-                            # self.app.ib.placeOrder(...) # Modify order
-                    else: # Short
-                        new_sl = current_price + self.fvg_trail_atr_mult * atr
-                        if new_sl < info["remaining_position_sl"]:
-                            info["remaining_position_sl"] = new_sl
-                            # self.app.ib.placeOrder(...) # Modify order
+                    new_sl_price = 0
+                    if position.position > 0:  # Long
+                        new_sl_price = current_price - self.fvg_trail_atr_mult * atr
+                        if new_sl_price > info["remaining_position_sl"]:
+                            self.log(f"Trailing SL for long position to {new_sl_price}")
+                            info["remaining_position_sl"] = new_sl_price
+                            await self.place_order(
+                                "SELL" if position.position > 0 else "BUY",
+                                abs(position.position),
+                                order_type="STP",
+                                stop_price=new_sl_price,
+                                order_id=info["stop_order_id"]
+                            )
 
                 if not info["partial_taken"] and self.fvg_partial_tp:
                     if (position.position > 0 and current_price >= info["partial_tp_price"]) or \
@@ -1572,7 +1596,7 @@ class FairValueGapStrategy(BaseStrategy):
                         await self.place_order("SELL" if position.position > 0 else "BUY", abs(position.position) / 2)
                         info["partial_taken"] = True
             else:
-                self.trade_info = None # Clear trade info if position is closed
+                self.trade_info = None
 
             latest_bar_time = df.index[-1]
             if latest_bar_time != last_processed_bar_time:
@@ -1580,7 +1604,7 @@ class FairValueGapStrategy(BaseStrategy):
                 self._calculate_support_resistance(df)
                 self._detect_market_regime(df)
 
-                if df['is_trending'].iloc[-1]:
+                if 'is_trending' in df.columns and df['is_trending'].iloc[-1]:
                     self._detect_new_fvg(df, len(df) - 1)
                     sig = self._update_active_fvgs(df, len(df) - 1)
 
@@ -1603,7 +1627,11 @@ class FairValueGapStrategy(BaseStrategy):
                         }
 
                         if self.auto_trade:
-                            await self.place_order(sig, qty, limit_price=sl_price, order_type="STP LMT")
+                            trade = await self.place_order(sig, qty, order_type="MKT")
+                            if trade:
+                                stop_order = await self.place_order("SELL" if sig == "BUY" else "BUY", qty, order_type="STP", stop_price=sl_price)
+                                if stop_order:
+                                    self.trade_info["stop_order_id"] = stop_order.order.orderId
 
         self.is_running = False
         self.log("FairValueGap strategy stopped.")

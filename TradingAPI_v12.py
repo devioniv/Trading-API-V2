@@ -745,7 +745,7 @@ class TradingApp(QMainWindow):
             if sec_type == "STK":
                 ib_contract = Stock(symbol, 'SMART', 'USD')
             elif sec_type == "CASH":
-                ib_contract = Forex(f"{symbol}USD") # Example, adjust as needed
+                ib_contract = Forex(symbol)
             elif sec_type == "FUT":
                 # Futures require more details like exchange, expiry
                 # This is a placeholder, adjust with real values
@@ -898,7 +898,7 @@ class TradingApp(QMainWindow):
         if sec_type == "STK":
             contract = Stock(symbol, 'SMART', 'USD')
         elif sec_type == "CASH":
-            contract = Forex(f"{symbol}USD")
+            contract = Forex(symbol)
         else:
             self.log(f"Live data for secType {sec_type} not currently supported.")
             return
@@ -1122,7 +1122,7 @@ class BaseStrategy:
             if sec_type == "STK":
                 ib_contract = Stock(self.symbol, 'SMART', 'USD')
             elif sec_type == "CASH":
-                ib_contract = Forex(f"{self.symbol}USD")
+                ib_contract = Forex(self.symbol)
             else:
                 self.log(f"Unsupported secType for placing order: {sec_type}")
                 return None

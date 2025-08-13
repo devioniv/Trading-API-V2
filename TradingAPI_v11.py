@@ -12,13 +12,12 @@ from PySide6.QtCore import Signal, Qt
 
 # Try to import IB libs — if missing, UI still works in fake-data mode.
 try:
-    from ib_async import IB, util, Stock, Forex, Future, Option, Crypto, MarketOrder, LimitOrder, StopOrder
+    from ib_async import IB, util, Stock, Forex, Future, Option, Crypto, MarketOrder, LimitOrder
     from numpy.random import default_rng # For modern numpy random generation
 except Exception:
     IB = None
     MarketOrder = None
     LimitOrder = None
-    StopOrder = None
     default_rng = None # Ensure it exists for type hinting
 
 import pandas as pd
@@ -38,6 +37,7 @@ def normalize_ta_columns(df: pd.DataFrame):
             return
         if "ATRr_14" in df.columns and "ATR_14" not in df.columns:
             df.rename(columns={"ATRr_14": "ATR_14"}, inplace=True)
+
         macd_candidates = [c for c in df.columns if re.search(r'(?i)macd', c)]
         main = signal = hist = None
         for c in macd_candidates:
@@ -73,7 +73,7 @@ class TradingApp(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("TradingAPI v12")
+        self.setWindowTitle("TradingAPI v11")
         self.resize(1400, 920)
 
         # IB client (optional)
@@ -109,7 +109,6 @@ class TradingApp(QMainWindow):
         self.data: Dict[str, pd.DataFrame] = {}
         self.strategies: Dict[int, object] = {}
         self.strategy_tasks: Dict[int, asyncio.Task] = {}
-        self.live_bar_subscriptions: Dict[str, object] = {}
         self.next_strategy_id = 1
 
         # signals
@@ -123,6 +122,9 @@ class TradingApp(QMainWindow):
         # build UI
         self.create_widgets()
         self.load_config()
+
+        # Attempt binding to live bar events if IB exposes them — defensive
+        self._bind_live_bar_events()
 
     # UI building
     def create_widgets(self):
@@ -139,7 +141,17 @@ class TradingApp(QMainWindow):
         top.addWidget(self.connect_btn)
         top.addWidget(self.disconnect_btn)
 
-        top.addStretch()
+        top.addSpacing(12)
+        top.addWidget(QLabel("Global Market Data Type:"))
+        self.global_data_type = QComboBox()
+        for name in DATA_TYPE_MAP:
+            self.global_data_type.addItem(name, DATA_TYPE_MAP[name])
+        top.addWidget(self.global_data_type)
+        self.apply_global_dt_btn = QPushButton("Apply Global DataType")
+        self.apply_global_dt_btn.clicked.connect(self.on_apply_global_data_type)
+        top.addWidget(self.apply_global_dt_btn)
+
+        top.addSpacing(12)
         top.addWidget(QLabel("Symbol:"))
         self.symbol_entry = QLineEdit()
         self.symbol_entry.setFixedWidth(120)
@@ -193,11 +205,14 @@ class TradingApp(QMainWindow):
         self.inst_table.setHorizontalHeaderLabels(["Symbol", "SecType", "DataType"])
         self._set_header_resize(self.inst_table, 3)
         # allow multi-row selection
-        self.inst_table.setSelectionBehavior(getattr(QAbstractItemView, "SelectRows", QAbstractItemView.SelectionBehavior.SelectRows))
-        self.inst_table.setSelectionMode(getattr(QAbstractItemView, "ExtendedSelection", QAbstractItemView.SelectionMode.ExtendedSelection))
+        self.inst_table.setSelectionBehavior(getattr(QAbstractItemView, "SelectRows", QAbstractItemView.SelectItems))
+        self.inst_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         inst_layout.addWidget(self.inst_table)
 
         inst_btns = QHBoxLayout()
+        self.fetch_history_btn = QPushButton("Fetch History (selected rows)")
+        self.fetch_history_btn.clicked.connect(self.on_fetch_history_selected)
+        inst_btns.addWidget(self.fetch_history_btn)
         self.remove_inst_btn = QPushButton("Remove Selected")
         self.remove_inst_btn.clicked.connect(self.on_remove_selected_instruments)
         inst_btns.addWidget(self.remove_inst_btn)
@@ -216,7 +231,7 @@ class TradingApp(QMainWindow):
         top_strat_row.addStretch()
         strat_layout.addLayout(top_strat_row)
 
-        self.strategy_types = ["WMA_RMA_MACD", "TrendlineBreakout", "SupportResistance", "FairValueGap"]
+        self.strategy_types = ["WMA_SMMA_MACD", "TrendlineBreakout", "SupportResistance", "FairValueGap"]
         self.strategy_checkboxes: Dict[str, QCheckBox] = {}
         strat_box = QGroupBox("Available Strategies")
         strat_box_layout = QHBoxLayout()
@@ -233,37 +248,37 @@ class TradingApp(QMainWindow):
         params_group = QGroupBox("Strategy-Specific Parameters")
         params_v_layout = QVBoxLayout()
 
-        # WMA/RMA/MACD params
-        wma_macd_box = QGroupBox("WMA_RMA_MACD")
+        # WMA/MACD params
+        wma_macd_box = QGroupBox("WMA_SMMA_MACD")
         wma_macd_layout = QHBoxLayout()
         wma_macd_layout.addWidget(QLabel("WMA Fast:"))
         self.wma_fast_spin = QSpinBox()
         self.wma_fast_spin.setRange(1, 1000)
-        self.wma_fast_spin.setValue(10)
+        self.wma_fast_spin.setValue(50)
         wma_macd_layout.addWidget(self.wma_fast_spin)
         wma_macd_layout.addSpacing(10)
-        wma_macd_layout.addWidget(QLabel("RMA Slow:"))
-        self.rma_slow_spin = QSpinBox()
-        self.rma_slow_spin.setRange(1, 1000)
-        self.rma_slow_spin.setValue(20)
-        wma_macd_layout.addWidget(self.rma_slow_spin)
+        wma_macd_layout.addWidget(QLabel("WMA Slow:"))
+        self.wma_slow_spin = QSpinBox()
+        self.wma_slow_spin.setRange(1, 1000)
+        self.wma_slow_spin.setValue(100)
+        wma_macd_layout.addWidget(self.wma_slow_spin)
         wma_macd_layout.addSpacing(10)
         wma_macd_layout.addWidget(QLabel("MACD Fast:"))
         self.macd_fast_spin = QSpinBox()
         self.macd_fast_spin.setRange(1, 1000)
-        self.macd_fast_spin.setValue(8)
+        self.macd_fast_spin.setValue(5)
         wma_macd_layout.addWidget(self.macd_fast_spin)
         wma_macd_layout.addSpacing(10)
         wma_macd_layout.addWidget(QLabel("MACD Slow:"))
         self.macd_slow_spin = QSpinBox()
         self.macd_slow_spin.setRange(1, 1000)
-        self.macd_slow_spin.setValue(13)
+        self.macd_slow_spin.setValue(10)
         wma_macd_layout.addWidget(self.macd_slow_spin)
         wma_macd_layout.addSpacing(10)
         wma_macd_layout.addWidget(QLabel("MACD Signal:"))
         self.macd_signal_spin = QSpinBox()
         self.macd_signal_spin.setRange(1, 1000)
-        self.macd_signal_spin.setValue(7)
+        self.macd_signal_spin.setValue(10)
         wma_macd_layout.addWidget(self.macd_signal_spin)
         wma_macd_layout.addStretch()
         wma_macd_box.setLayout(wma_macd_layout)
@@ -367,26 +382,6 @@ class TradingApp(QMainWindow):
         fvg_row2_layout.addWidget(self.fvg_support_tolerance_spin)
         fvg_row2_layout.addStretch()
         fvg_layout.addLayout(fvg_row2_layout)
-
-        fvg_row3_layout = QHBoxLayout()
-        self.fvg_dynamic_sizing_chk = QCheckBox("Dynamic Sizing")
-        self.fvg_dynamic_sizing_chk.setChecked(True)
-        fvg_row3_layout.addWidget(self.fvg_dynamic_sizing_chk)
-        self.fvg_partial_tp_chk = QCheckBox("Partial TP")
-        self.fvg_partial_tp_chk.setChecked(True)
-        fvg_row3_layout.addWidget(self.fvg_partial_tp_chk)
-        self.fvg_trailing_stop_chk = QCheckBox("Trailing Stop")
-        self.fvg_trailing_stop_chk.setChecked(True)
-        fvg_row3_layout.addWidget(self.fvg_trailing_stop_chk)
-        fvg_row3_layout.addWidget(QLabel("Trail ATR Mult:"))
-        self.fvg_trail_atr_mult_spin = QDoubleSpinBox()
-        self.fvg_trail_atr_mult_spin.setRange(0.1, 10.0)
-        self.fvg_trail_atr_mult_spin.setSingleStep(0.1)
-        self.fvg_trail_atr_mult_spin.setValue(1.0)
-        fvg_row3_layout.addWidget(self.fvg_trail_atr_mult_spin)
-        fvg_row3_layout.addStretch()
-        fvg_layout.addLayout(fvg_row3_layout)
-
         fvg_box.setLayout(fvg_layout)
         params_v_layout.addWidget(fvg_box)
 
@@ -436,13 +431,17 @@ class TradingApp(QMainWindow):
     def _set_header_resize(self, table: QTableWidget, cols: int):
         try:
             header = table.horizontalHeader()
-            stretch_mode = getattr(QHeaderView, "Stretch", getattr(QHeaderView, "ResizeMode", {}).Stretch)
+            # Try both enum styles to avoid Pylance errors
+            if hasattr(QHeaderView, "Stretch"):
+                mode = QHeaderView.Stretch
+            else:
+                mode = getattr(QHeaderView, "ResizeMode", QHeaderView).Stretch
             for c in range(cols):
-                header.setSectionResizeMode(c, stretch_mode)
+                header.setSectionResizeMode(c, mode)
         except Exception:
             try:
-                resize_mode = getattr(QHeaderView, "ResizeToContents", getattr(QHeaderView, "ResizeMode", {}).ResizeToContents)
-                table.horizontalHeader().setSectionResizeMode(resize_mode)
+                # fallback single call
+                table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
             except Exception:
                 pass
 
@@ -637,36 +636,53 @@ class TradingApp(QMainWindow):
         except Exception:
             pass
 
-    def _on_bar_update(self, bars, hasNewBar):
-        """Callback for live bar updates."""
-        if not hasNewBar:
+    # Attempt to bind live bar/historical events (best-effort)
+    def _bind_live_bar_events(self):
+        if not self.ib:
             return
+        # try several possible event names the wrapper might expose
+        event_names = ["historicalDataEvent", "historicalData", "realtimeBarEvent", "barUpdateEvent", "realtimeBarsEvent"]
+        for name in event_names:
+            try:
+                evt = getattr(self.ib, name, None)
+                if evt is not None:
+                    # bind a handler that logs candlestick receptions
+                    evt += self._on_live_bar_event
+                    self.log(f"Bound live bar handler to event: {name}")
+                    break
+            except Exception:
+                pass
 
+    def _on_live_bar_event(self, *args, **kwargs):
+        # The event callback signature varies by wrapper; defensively extract symbol/timeframe if available
         try:
-            symbol = bars.contract.symbol
-            df = self.data.get(symbol)
-            if df is None:
-                return
-
-            last_bar = bars[-1]
-            # Create a new row from the bar data
-            # The index should be a datetime object
-            new_row = pd.DataFrame([{
-                "open": last_bar.open,
-                "high": last_bar.high,
-                "low": last_bar.low,
-                "close": last_bar.close,
-                "volume": last_bar.volume,
-            }], index=[pd.to_datetime(last_bar.time)])
-
-            # Append the new row to the existing DataFrame
-            self.data[symbol] = pd.concat([df, new_row])
-
-            self.log(f"Live data update for {symbol}: new 5-second bar received at {last_bar.time}")
-
-        except Exception as e:
-            self.log(f"Error in _on_bar_update: {e}")
-            traceback.print_exc()
+            sym = None
+            timeframe = "unknown"
+            bar_info = None
+            # common shapes: (reqId, bar) or (contract, bar) or (symbol, bar)
+            if args:
+                for a in args:
+                    if hasattr(a, "symbol"):
+                        sym = getattr(a, "symbol")
+                    if isinstance(a, str):
+                        # sometimes first arg is symbol or reqId
+                        if a.upper() in self.instruments:
+                            sym = a.upper()
+                # last arg may be bar-like
+                bar_info = args[-1]
+            if kwargs and "bar" in kwargs:
+                bar_info = kwargs["bar"]
+            # try to extract datetime
+            dt = None
+            if bar_info is not None:
+                dt = getattr(bar_info, "time", None) or getattr(bar_info, "date", None) or bar_info.get("date", None) if isinstance(bar_info, dict) else None
+            ts = dt if dt is not None else time.strftime("%Y-%m-%d %H:%M:%S")
+            if sym:
+                self.log(f"Candlestick data received for {sym} (live event) at {ts}")
+            else:
+                self.log(f"Candlestick data received (live event) at {ts}")
+        except Exception:
+            pass
 
     # ---- UI callbacks / instrument management ----
     def on_add_instrument(self):
@@ -675,13 +691,10 @@ class TradingApp(QMainWindow):
         if not s:
             QMessageBox.warning(self, "Input", "Enter a symbol.")
             return
-
-        # Set data type: 1=Live for CASH, 3=Delayed for others
-        dtype = 1 if sec == "CASH" else 3
-        dtype_map_rev = {v: k for k, v in DATA_TYPE_MAP.items()}
-
+        # assign default data type from global selector
+        dtype = self.global_data_type.currentData()
         self.instruments[s] = {"symbol": s, "secType": sec, "dataType": dtype}
-        self.log(f"Instrument added: {s} ({sec}), default dataType={dtype_map_rev.get(dtype, 'Unknown')}")
+        self.log(f"Instrument added: {s} ({sec}), dataType={self.global_data_type.currentText()}")
         self.instrument_list_update_signal.emit(list(self.instruments.keys()))
 
     def on_remove_selected_instruments(self):
@@ -701,6 +714,21 @@ class TradingApp(QMainWindow):
                 self.log(f"Removed instruments: {', '.join(removed)}")
         except Exception as e:
             self.log(f"remove selected instruments error: {e}")
+
+    def on_fetch_history_selected(self):
+        try:
+            rows = sorted(set(idx.row() for idx in self.inst_table.selectedIndexes()))
+            if not rows:
+                QMessageBox.information(self, "Select", "Select instrument rows to fetch history.")
+                return
+            for r in rows:
+                item = self.inst_table.item(r, 0)
+                if item:
+                    sym = item.text()
+                    # schedule historical fetch; after fetch we log candlestick confirmation
+                    self.add_task(self._fetch_and_store_historical(sym))
+        except Exception as e:
+            self.log(f"fetch history selected error: {e}")
 
     async def _fetch_and_store_historical(self, symbol: str, duration="1 D", bar_size="5 mins"):
         """
@@ -725,10 +753,9 @@ class TradingApp(QMainWindow):
                 df['close'] = df['open'] + (rng.standard_normal(n) * 0.03)
                 df.reset_index(inplace=True)
                 df.rename(columns={'index': 'datetime'}, inplace=True)
-                df.set_index('datetime', inplace=True)
                 self.data[symbol] = df
                 normalize_ta_columns(df)
-                last_time = df.index[-1]
+                last_time = df['datetime'].iloc[-1]
                 self.log(f"Candlestick data received for {symbol} (fake) last bar at {last_time}")
                 return df
 
@@ -743,7 +770,7 @@ class TradingApp(QMainWindow):
             if sec_type == "STK":
                 ib_contract = Stock(symbol, 'SMART', 'USD')
             elif sec_type == "CASH":
-                ib_contract = Forex(symbol)
+                ib_contract = Forex(f"{symbol}USD") # Example, adjust as needed
             elif sec_type == "FUT":
                 # Futures require more details like exchange, expiry
                 # This is a placeholder, adjust with real values
@@ -752,21 +779,13 @@ class TradingApp(QMainWindow):
                 self.log(f"Unsupported secType for historical data fetch: {sec_type}")
                 return None
 
-            # Set parameters based on secType
-            if sec_type == 'CASH':
-                what_to_show = 'MIDPOINT'
-                use_rth = False
-            else:
-                what_to_show = 'TRADES'
-                use_rth = True
-
             bars = await self.ib.reqHistoricalDataAsync(
                 ib_contract,
                 endDateTime='',
                 durationStr=duration,
                 barSizeSetting=bar_size,
-                whatToShow=what_to_show,
-                useRTH=use_rth
+                whatToShow='TRADES',
+                useRTH=True
             )
 
             if not bars:
@@ -789,9 +808,23 @@ class TradingApp(QMainWindow):
             traceback.print_exc()
             return None
 
+    # Apply global data type for instruments missing explicit dataType
+    def on_apply_global_data_type(self):
+        try:
+            val = self.global_data_type.currentData()
+            applied = []
+            for sym, info in self.instruments.items():
+                if info.get("dataType", None) is None:
+                    info["dataType"] = val
+                    applied.append(sym)
+            self.instrument_list_update_signal.emit(list(self.instruments.keys()))
+            self.log(f"Applied global data type to: {', '.join(applied) if applied else '<none>'}")
+        except Exception as e:
+            self.log(f"on_apply_global_data_type error: {e}")
+
     # ---- Strategy Manager: select-all behavior ----
     def on_select_all_toggled(self, state):
-        checked = state == getattr(Qt, "Checked", Qt.CheckState.Checked)
+        checked = state == Qt.Checked
         try:
             for cb in self.strategy_checkboxes.values():
                 cb.blockSignals(True)
@@ -823,9 +856,9 @@ class TradingApp(QMainWindow):
                 "interval_seconds": float(self.interval_spin.value()),
                 "auto_trade": bool(self.auto_trade_chk.isChecked()),
 
-            # WMA_RMA_MACD params
+                # WMA_SMMA_MACD params
                 "wma_fast": self.wma_fast_spin.value(),
-            "rma_slow": self.rma_slow_spin.value(),
+                "wma_slow": self.wma_slow_spin.value(),
                 "macd_fast": self.macd_fast_spin.value(),
                 "macd_slow": self.macd_slow_spin.value(),
                 "macd_signal": self.macd_signal_spin.value(),
@@ -847,10 +880,6 @@ class TradingApp(QMainWindow):
                 "upper_threshold": self.fvg_upper_thresh_spin.value(),
                 "support_lookback": self.fvg_support_lookback_spin.value(),
                 "support_tolerance": self.fvg_support_tolerance_spin.value(),
-                "fvg_dynamic_sizing": self.fvg_dynamic_sizing_chk.isChecked(),
-                "fvg_partial_tp": self.fvg_partial_tp_chk.isChecked(),
-                "fvg_trailing_stop": self.fvg_trailing_stop_chk.isChecked(),
-                "fvg_trail_atr_mult": self.fvg_trail_atr_mult_spin.value(),
             }
             apply_to_selected = self.apply_to_selected_chk.isChecked()
             symbol_list: List[str] = []
@@ -871,57 +900,15 @@ class TradingApp(QMainWindow):
                 symbol_list = [sym]
             for sym in symbol_list:
                 for st in checked:
-                    self.add_task(self._create_and_start_strategy(sym, st, params))
+                    self._create_and_start_strategy(sym, st, params)
         except Exception as e:
             self.log(f"on_create_checked_strategies error: {e}")
 
-    async def _subscribe_to_instrument_data(self, symbol: str):
-        """Subscribe to historical and live data for an instrument."""
-        if symbol in self.data:
-            self.log(f"Data for {symbol} already exists. Skipping subscription.")
-            return
-
-        self.log(f"Subscribing to data for {symbol}...")
-        # 1. Fetch historical data
-        await self._fetch_and_store_historical(symbol)
-
-        # 2. Request live data
-        if self.ib and self.ib.isConnected():
-            await self._request_live_bars(symbol)
-
-    async def _request_live_bars(self, symbol: str):
-        """Request real-time 5-second bars for a symbol."""
-        if symbol in self.live_bar_subscriptions:
-            self.log(f"Already subscribed to live bars for {symbol}.")
-            return
-
-        contract_info = self.instruments.get(symbol)
-        if not contract_info:
-            self.log(f"Cannot request live bars, no contract info for {symbol}")
-            return
-
-        sec_type = contract_info.get("secType", "STK").upper()
-        if sec_type == "STK":
-            contract = Stock(symbol, 'SMART', 'USD')
-        elif sec_type == "CASH":
-            contract = Forex(symbol)
-        else:
-            self.log(f"Live data for secType {sec_type} not currently supported.")
-            return
-
-        self.log(f"Requesting real-time bars for {symbol}...")
-        bars = self.ib.reqRealTimeBars(contract, 5, 'TRADES', False)
-        self.live_bar_subscriptions[symbol] = bars
-        bars.updateEvent += self._on_bar_update
-
-    async def _create_and_start_strategy(self, symbol: str, strat_type: str, params: Dict[str, Any]):
+    def _create_and_start_strategy(self, symbol: str, strat_type: str, params: Dict[str, Any]):
         try:
-            # Ensure data is subscribed before starting strategy
-            await self._subscribe_to_instrument_data(symbol)
-
             strategy = None
-            if strat_type == "WMA_RMA_MACD":
-                strategy = WmaRmaMacdStrategy(self, symbol, params)
+            if strat_type == "WMA_SMMA_MACD":
+                strategy = WmaSmmaMacdStrategy(self, symbol, params)
             elif strat_type == "TrendlineBreakout":
                 strategy = TrendlineBreakoutStrategy(self, symbol, params)
             elif strat_type == "SupportResistance":
@@ -1025,14 +1012,19 @@ class TradingApp(QMainWindow):
                 cb = QComboBox()
                 for k in DATA_TYPE_MAP:
                     cb.addItem(k, DATA_TYPE_MAP[k])
-
-                # The dataType is now guaranteed to be set when an instrument is added.
-                dtype = info.get("dataType")
-                for i in range(cb.count()):
-                    if cb.itemData(i) == dtype:
-                        cb.setCurrentIndex(i)
-                        break
-
+                dtype = info.get("dataType", None)
+                if dtype is None:
+                    # global default index
+                    gv = self.global_data_type.currentData()
+                    for i in range(cb.count()):
+                        if cb.itemData(i) == gv:
+                            cb.setCurrentIndex(i)
+                            break
+                else:
+                    for i in range(cb.count()):
+                        if cb.itemData(i) == dtype:
+                            cb.setCurrentIndex(i)
+                            break
                 def make_on_change(sym=s, combobox=cb):
                     def on_change(idx):
                         try:
@@ -1115,38 +1107,31 @@ class BaseStrategy:
     def log(self, msg: str):
         self.app.log(f"[{self.__class__.__name__}:{self.symbol}] {msg}")
 
-    async def place_order(self, action: str, qty: float, order_type: str = "MKT", limit_price: Optional[float] = None, stop_price: Optional[float] = None, order_id: Optional[int] = None):
+    async def place_order(self, action: str, qty: float, order_type: str = "MKT", limit_price: Optional[float] = None):
         try:
-            if self.app.ib is None or not self.app.ib.isConnected():
-                self.log("IB not available or not connected — skipping order.")
+            if self.app.ib is None:
+                self.log("IB not available — skipping order.")
                 return None
             if self.contract is None:
                 self.log("No contract for order.")
                 return None
 
+            # Create a proper contract object for ib_async
             sec_type = self.contract.get("secType", "STK").upper()
             if sec_type == "STK":
                 ib_contract = Stock(self.symbol, 'SMART', 'USD')
             elif sec_type == "CASH":
-                ib_contract = Forex(self.symbol)
+                ib_contract = Forex(f"{self.symbol}USD")
             else:
                 self.log(f"Unsupported secType for placing order: {sec_type}")
                 return None
 
             if order_type.upper() == "MKT":
                 order = MarketOrder(action, float(qty))
-            elif order_type.upper() == "LMT":
-                order = LimitOrder(action, float(qty), float(limit_price) if limit_price is not None else 0.0)
-            elif order_type.upper() == "STP":
-                order = StopOrder(action, float(qty), float(stop_price) if stop_price is not None else 0.0)
             else:
-                self.log(f"Unsupported order type: {order_type}")
-                return None
+                order = LimitOrder(action, float(qty), float(limit_price) if limit_price is not None else 0.0)
 
-            if order_id:
-                order.orderId = order_id
-
-            self.log(f"Placing order: {action} {qty} {self.symbol} @ {order_type}")
+            self.log(f"Placing order: {action} {qty} {self.symbol}")
             trade = self.app.ib.placeOrder(ib_contract, order)
             self.log(f"Trade object: {trade}")
             return trade
@@ -1159,9 +1144,14 @@ class BaseStrategy:
     def get_dataframe(self) -> Optional[pd.DataFrame]:
         try:
             maybe = self.app.data.get(self.symbol)
-            if maybe is None: return None
-            if isinstance(maybe, pd.DataFrame): return maybe.copy()
-            return pd.DataFrame(maybe)
+            if maybe is None:
+                return None
+            if isinstance(maybe, pd.DataFrame):
+                return maybe.copy()
+            try:
+                return pd.DataFrame(maybe)
+            except Exception:
+                return None
         except Exception as e:
             self.log(f"get_dataframe error: {e}")
             return None
@@ -1180,21 +1170,21 @@ class BaseStrategy:
     def stop(self):
         self.is_running = False
 
-class WmaRmaMacdStrategy(BaseStrategy):
+class WmaSmmaMacdStrategy(BaseStrategy):
     def __init__(self, app, symbol, params=None):
         super().__init__(app, symbol, params)
-        self.wma_fast = int(self.params.get("wma_fast", 10))
-        self.rma_slow = int(self.params.get("rma_slow", 20))
-        self.macd_fast = int(self.params.get("macd_fast", 8))
-        self.macd_slow = int(self.params.get("macd_slow", 13))
-        self.macd_signal = int(self.params.get("macd_signal", 7))
+        self.wma_fast = int(self.params.get("wma_fast", 50))
+        self.wma_slow = int(self.params.get("wma_slow", 100))
+        self.macd_fast = int(self.params.get("macd_fast", 5))
+        self.macd_slow = int(self.params.get("macd_slow", 10))
+        self.macd_signal = int(self.params.get("macd_signal", 10))
 
     def calculate_indicators(self, df: pd.DataFrame):
         try:
             df.ta.wma(length=self.wma_fast, append=True, col_names=(f'WMA_{self.wma_fast}',))
-            df.ta.rma(length=self.rma_slow, append=True, col_names=(f'RMA_{self.rma_slow}',))
+            df.ta.wma(length=self.wma_slow, append=True, col_names=(f'WMA_{self.wma_slow}',))
         except Exception as e:
-            self.log(f"Indicator calculation error: {e}")
+            self.log(f"WMA calculation error: {e}")
             pass
         try:
             df.ta.macd(fast=self.macd_fast, slow=self.macd_slow, signal=self.macd_signal, append=True)
@@ -1208,20 +1198,20 @@ class WmaRmaMacdStrategy(BaseStrategy):
             return None
         try:
             price = df['close'].iloc[-1]
-            wma_col = f"WMA_{self.wma_fast}"
-            rma_col = f"RMA_{self.rma_slow}"
-            if wma_col not in df.columns or rma_col not in df.columns or "MACD_hist" not in df.columns:
-                self.log(f"Indicator columns missing: needs {wma_col}, {rma_col}, MACD_hist")
+            wf_col = f"WMA_{self.wma_fast}"
+            ws_col = f"WMA_{self.wma_slow}"
+            if wf_col not in df.columns or ws_col not in df.columns or "MACD_hist" not in df.columns:
+                self.log(f"Indicator columns missing: needs {wf_col}, {ws_col}, MACD_hist")
                 return None
 
-            wma_val = df[wma_col].iloc[-1]
-            rma_val = df[rma_col].iloc[-1]
+            wv = df[wf_col].iloc[-1]
+            sv = df[ws_col].iloc[-1]
             macd_hist = df["MACD_hist"].iloc[-1]
             prev_macd_hist = df["MACD_hist"].iloc[-2]
 
-            if price > wma_val > rma_val and macd_hist > 0 and macd_hist > prev_macd_hist:
+            if price > wv > sv and macd_hist > 0 and macd_hist > prev_macd_hist:
                 return "BUY"
-            if price < wma_val < rma_val and macd_hist < 0 and macd_hist < prev_macd_hist:
+            if price < wv < sv and macd_hist < 0 and macd_hist < prev_macd_hist:
                 return "SELL"
         except Exception as e:
             self.log(f"check_conditions error: {e}")
@@ -1229,7 +1219,7 @@ class WmaRmaMacdStrategy(BaseStrategy):
 
     async def run(self):
         self.is_running = True
-        self.log("WMA/RMA+MACD strategy started.")
+        self.log("WMA/SMMA+MACD strategy started.")
         try:
             while self.is_running:
                 await asyncio.sleep(self.interval)
@@ -1244,12 +1234,12 @@ class WmaRmaMacdStrategy(BaseStrategy):
                     if self.auto_trade:
                         await self.place_order(sig, qty)
         except asyncio.CancelledError:
-            self.log("WMA/RMA+MACD task cancelled.")
+            self.log("WMA/SMMA+MACD task cancelled.")
         except Exception as e:
             self.log(f"run error: {e}")
         finally:
             self.is_running = False
-            self.log("WMA/RMA+MACD strategy stopped.")
+            self.log("WMA/SMMA+MACD strategy stopped.")
 
 class TrendlineBreakoutStrategy(BaseStrategy):
     def __init__(self, app, symbol, params=None):
@@ -1378,86 +1368,7 @@ class FairValueGapStrategy(BaseStrategy):
         self.upper_threshold = float(self.params.get("upper_threshold", 0.6))
         self.support_lookback = int(self.params.get("support_lookback", 5))
         self.support_tolerance = float(self.params.get("support_tolerance", 0.01))
-        self.fvg_dynamic_sizing = bool(self.params.get("fvg_dynamic_sizing", True))
-        self.fvg_partial_tp = bool(self.params.get("fvg_partial_tp", True))
-        self.fvg_trailing_stop = bool(self.params.get("fvg_trailing_stop", True))
-        self.fvg_trail_atr_mult = float(self.params.get("fvg_trail_atr_mult", 1.0))
         self.active_fvgs = []
-        self.trade_info = None
-
-    def _determine_position_size(self, df, i):
-        if not self.fvg_dynamic_sizing:
-            return self.qty
-
-        confluence_score = 0
-        if 'on_recent_support' in df.columns and (df['on_recent_support'].iloc[i] or df['on_recent_resistance'].iloc[i]):
-            confluence_score += 1
-        if 'BOS' in df.columns and df['BOS'].iloc[i]:
-            confluence_score += 1
-        if df['is_trending'].iloc[i]:
-            confluence_score += 1
-
-        position_sizes = {1: 0.2, 2: 0.4, 3: 0.5}
-        if self.app.ib and self.app.ib.isConnected():
-            account_values = self.app.ib.accountValues()
-            net_liquidation_str = next((v.value for v in account_values if v.tag == 'NetLiquidation' and v.currency == 'USD'), None)
-
-            if net_liquidation_str:
-                try:
-                    net_liquidation = float(net_liquidation_str)
-                    current_price = df['close'].iloc[i]
-                    risk_fraction = position_sizes.get(confluence_score, 0.01) # Default to 1% risk
-
-                    if current_price > 0:
-                        # Allocate a fraction of portfolio based on confluence
-                        dollar_amount = net_liquidation * risk_fraction
-                        return dollar_amount / current_price
-                    else:
-                        self.log("Current price is 0, cannot calculate dynamic size.")
-                except (ValueError, TypeError) as e:
-                    self.log(f"Could not parse NetLiquidation value: {net_liquidation_str}, error: {e}")
-
-        self.log("NetLiquidation value not available, using default qty.")
-        return self.qty
-
-    def _calculate_support_resistance(self, df: pd.DataFrame):
-        df['is_support_candle'] = (
-            (df['low'] <= df['low'].shift(1).rolling(window=self.support_lookback).min()) &
-            (df['low'] <= df['low'].shift(-1).rolling(window=self.support_lookback).min())
-        )
-        df['is_resistance_candle'] = (
-            (df['high'] >= df['high'].shift(1).rolling(window=self.support_lookback).max()) &
-            (df['high'] >= df['high'].shift(-1).rolling(window=self.support_lookback).max())
-        )
-        support_prices = df['low'].where(df['is_support_candle'], np.nan)
-        resistance_prices = df['high'].where(df['is_resistance_candle'], np.nan)
-
-        df['on_recent_support'] = support_prices.ffill(limit=self.support_lookback).rolling(window=self.support_lookback, min_periods=1).min().abs().sub(df['low'].abs()).lt(self.support_tolerance * df['low'])
-        df['on_recent_resistance'] = resistance_prices.ffill(limit=self.support_lookback).rolling(window=self.support_lookback, min_periods=1).max().abs().sub(df['high'].abs()).lt(self.support_tolerance * df['high'])
-
-    def _detect_market_regime(self, df: pd.DataFrame, ma_length=50, slope_threshold=0.01, atr_length=14, atr_threshold=1.5, adx_length=14, adx_threshold=25):
-        df['ma'] = df['close'].rolling(window=ma_length).mean()
-        df['ma_slope'] = df['ma'].diff()
-        df['is_strong_bullish_slope'] = df['ma_slope'] > slope_threshold
-        df['is_strong_bearish_slope'] = df['ma_slope'] < -slope_threshold
-
-        df.ta.atr(length=atr_length, append=True)
-        normalize_ta_columns(df)
-        atr_col = f"ATR_{atr_length}"
-        if atr_col in df.columns:
-            df['atr_mean'] = df[atr_col].rolling(atr_length).mean()
-            df['high_volatility'] = df[atr_col] > df['atr_mean'] * atr_threshold
-        else:
-            df['high_volatility'] = False
-
-        adx_df = ta.adx(high=df['high'], low=df['low'], close=df['close'], length=adx_length)
-        if adx_df is not None and not adx_df.empty:
-            df[f'ADX_{adx_length}'] = adx_df[f'ADX_{adx_length}']
-            df['strong_adx'] = df[f'ADX_{adx_length}'] > adx_threshold
-        else:
-            df['strong_adx'] = False
-
-        df['is_trending'] = (df['is_strong_bullish_slope'] | df['is_strong_bearish_slope']) & df['high_volatility'] & df['strong_adx']
 
     def _is_break_of_structure(self, df, current_idx, fvg_low, fvg_high, direction="bullish"):
         start_idx = max(0, current_idx - self.lookback_bos)
@@ -1478,7 +1389,7 @@ class FairValueGapStrategy(BaseStrategy):
         return False
 
     def _fvg_is_in_allowed_range(self, df, fvg_low, fvg_high, current_idx, direction="bullish"):
-        start_idx = max(0, current_idx - 200)
+        start_idx = max(0, current_idx - 200) # Using fixed lookback of 200 from notebook
         recent_df = df.iloc[start_idx:current_idx + 1]
         range_high = recent_df['high'].max()
         range_low = recent_df['low'].min()
@@ -1495,133 +1406,99 @@ class FairValueGapStrategy(BaseStrategy):
     def _detect_new_fvg(self, df, i):
         if i < 2: return
 
-        high_i2, low_i = df['high'].iloc[i-2], df['low'].iloc[i]
-        low_i2, high_i = df['low'].iloc[i-2], df['high'].iloc[i]
+        high_i2 = df['high'].iloc[i - 2]
+        low_i = df['low'].iloc[i]
+        low_i2 = df['low'].iloc[i - 2]
+        high_i = df['high'].iloc[i]
 
         fvg_types = [
-            {"direction": "bullish", "fvg_low": high_i2, "fvg_high": low_i, "gap_size": low_i - high_i2, "threshold": high_i2 < low_i, "support_key": "on_recent_support"},
-            {"direction": "bearish", "fvg_low": high_i, "fvg_high": low_i2, "gap_size": low_i2 - high_i, "threshold": low_i2 > high_i, "support_key": "on_recent_resistance"}
+            {"direction": "bullish", "fvg_low": high_i2, "fvg_high": low_i, "gap_size": low_i - high_i2, "threshold": high_i2 < low_i},
+            {"direction": "bearish", "fvg_low": high_i, "fvg_high": low_i2, "gap_size": low_i2 - high_i, "threshold": low_i2 > high_i}
         ]
 
         for fvg in fvg_types:
             if fvg["gap_size"] >= self.min_gap_size and fvg["threshold"]:
                 bos = self._is_break_of_structure(df, i, fvg["fvg_low"], fvg["fvg_high"], fvg["direction"])
                 in_range = self._fvg_is_in_allowed_range(df, fvg["fvg_low"], fvg["fvg_high"], i, fvg["direction"])
-                on_support = df[fvg["support_key"]].iloc[i]
 
-                df.loc[i, 'BOS'] = bos
-                if (bos or on_support) and in_range:
+                if bos or in_range: # Simplified confluence, can add support/resistance later
                     self.active_fvgs.append({
                         "start_idx": i, "fvg_low": fvg["fvg_low"], "fvg_high": fvg["fvg_high"],
                         "zone_tested": False, "validation_candles": 0, "direction": fvg["direction"]
                     })
-                    self.log(f"New {fvg['direction']} FVG detected at index {i} with confluence.")
+                    self.log(f"New {fvg['direction']} FVG detected at index {i}")
 
     def _update_active_fvgs(self, df, i):
-        current_candle, prev_candle = df.iloc[i], df.iloc[i-1]
-        to_remove, signal = [], None
+        current_candle = df.iloc[i]
+        prev_candle = df.iloc[i - 1]
+        to_remove = []
+        signal = None
 
-        for idx, fvg in enumerate(self.active_fvgs):
-            direction, fvg_low, fvg_high = fvg["direction"], fvg["fvg_low"], fvg["fvg_high"]
+        for idx, fvg_dict in enumerate(self.active_fvgs):
+            direction = fvg_dict["direction"]
+            fvg_low = fvg_dict["fvg_low"]
+            fvg_high = fvg_dict["fvg_high"]
 
-            if not fvg['zone_tested']:
-                if (direction == "bullish" and current_candle['low'] <= fvg_high) or \
-                   (direction == "bearish" and current_candle['high'] >= fvg_low):
-                    fvg['zone_tested'] = True
+            if not fvg_dict['zone_tested']:
+                if direction == "bullish" and (current_candle['low'] <= fvg_high and current_candle['high'] >= fvg_high):
+                    fvg_dict['zone_tested'] = True
+                elif direction == "bearish" and (current_candle['high'] >= fvg_low and current_candle['low'] <= fvg_low):
+                    fvg_dict['zone_tested'] = True
             else:
-                fvg['validation_candles'] += 1
-                if (direction == "bullish" and current_candle['close'] > fvg_high and prev_candle['close'] < fvg_high) or \
-                   (direction == "bearish" and current_candle['close'] < fvg_low and prev_candle['close'] > fvg_low):
-                    self.log(f"{direction.capitalize()} FVG validated at index {i}")
-                    signal = "BUY" if direction == "bullish" else "SELL"
+                fvg_dict['validation_candles'] += 1
+                if direction == "bullish" and current_candle['close'] > fvg_high:
+                    self.log(f"Bullish FVG validated at index {i}")
+                    signal = "BUY"
+                    to_remove.append(idx)
+                elif direction == "bearish" and current_candle['close'] < fvg_low:
+                    self.log(f"Bearish FVG validated at index {i}")
+                    signal = "SELL"
                     to_remove.append(idx)
 
-            if fvg['validation_candles'] >= self.max_candles:
-                to_remove.append(idx)
+                if fvg_dict['validation_candles'] >= self.max_candles:
+                    to_remove.append(idx)
 
-        for r_idx in sorted(to_remove, reverse=True): self.active_fvgs.pop(r_idx)
+        for r_idx in sorted(to_remove, reverse=True):
+            self.active_fvgs.pop(r_idx)
+
         return signal
 
     async def run(self):
         self.is_running = True
         self.log("FairValueGap strategy started.")
+
         last_processed_bar_time = None
 
-        while self.is_running:
-            await asyncio.sleep(self.interval)
-            df = self.get_dataframe()
-            if df is None or len(df) < self.lookback_bos:
-                continue
+        try:
+            while self.is_running:
+                await asyncio.sleep(self.interval)
+                df = self.get_dataframe()
+                if df is None or len(df) < self.lookback_bos:
+                    continue
 
-            current_price = df['close'].iloc[-1]
-            position = None
-            if self.app.ib and self.app.ib.isConnected():
-                position = next((p for p in self.app.ib.positions() if p.contract.symbol == self.symbol), None)
-
-            if self.trade_info and position:
-                info = self.trade_info
-                if info.get("stop_order_id") and info["partial_taken"] and self.fvg_trailing_stop:
-                    atr = df[f"ATR_{self.params.get('atr_length', 14)}"].iloc[-1]
-                    new_sl_price = 0
-                    if position.position > 0:  # Long
-                        new_sl_price = current_price - self.fvg_trail_atr_mult * atr
-                        if new_sl_price > info["remaining_position_sl"]:
-                            self.log(f"Trailing SL for long position to {new_sl_price}")
-                            info["remaining_position_sl"] = new_sl_price
-                            await self.place_order(
-                                "SELL" if position.position > 0 else "BUY",
-                                abs(position.position),
-                                order_type="STP",
-                                stop_price=new_sl_price,
-                                order_id=info["stop_order_id"]
-                            )
-
-                if not info["partial_taken"] and self.fvg_partial_tp:
-                    if (position.position > 0 and current_price >= info["partial_tp_price"]) or \
-                       (position.position < 0 and current_price <= info["partial_tp_price"]):
-                        self.log("Partial take profit hit.")
-                        await self.place_order("SELL" if position.position > 0 else "BUY", abs(position.position) / 2)
-                        info["partial_taken"] = True
-            else:
-                self.trade_info = None
-
-            latest_bar_time = df.index[-1]
-            if latest_bar_time != last_processed_bar_time:
+                # To avoid reprocessing the same data if no new bar has arrived
+                latest_bar_time = df.index[-1]
+                if latest_bar_time == last_processed_bar_time:
+                    continue
                 last_processed_bar_time = latest_bar_time
-                self._calculate_support_resistance(df)
-                self._detect_market_regime(df)
 
-                if 'is_trending' in df.columns and df['is_trending'].iloc[-1]:
-                    self._detect_new_fvg(df, len(df) - 1)
-                    sig = self._update_active_fvgs(df, len(df) - 1)
+                # We check for new FVGs on the second to last bar, and validate on the last bar
+                self._detect_new_fvg(df, len(df) - 2)
+                sig = self._update_active_fvgs(df, len(df) - 1)
 
-                    if sig and not self.trade_info:
-                        qty = self._determine_position_size(df, len(df) - 1)
-                        self.log(f"Live FVG Signal: {sig} for {qty} shares")
+                if sig:
+                    self.log(f"FVG Signal detected: {sig}")
+                    if self.auto_trade:
+                        await self.place_order(sig, self.qty)
 
-                        risk_multiplier = 0.99 if sig == "BUY" else 1.01
-                        fvg_level = df['high'].iloc[-3] if sig == "BUY" else df['low'].iloc[-3]
-                        sl_price = fvg_level * risk_multiplier
-                        risk = abs(current_price - sl_price)
-                        partial_tp_price = current_price + 1.5 * risk if sig == "BUY" else current_price - 1.5 * risk
-
-                        self.trade_info = {
-                            "initial_sl": sl_price,
-                            "partial_tp_price": partial_tp_price,
-                            "remaining_position_sl": sl_price,
-                            "partial_taken": False,
-                            "entry_price": current_price
-                        }
-
-                        if self.auto_trade:
-                            trade = await self.place_order(sig, qty, order_type="MKT")
-                            if trade:
-                                stop_order = await self.place_order("SELL" if sig == "BUY" else "BUY", qty, order_type="STP", stop_price=sl_price)
-                                if stop_order:
-                                    self.trade_info["stop_order_id"] = stop_order.order.orderId
-
-        self.is_running = False
-        self.log("FairValueGap strategy started.")
+        except asyncio.CancelledError:
+            self.log("FairValueGap task cancelled.")
+        except Exception as e:
+            self.log(f"run error: {e}")
+            traceback.print_exc()
+        finally:
+            self.is_running = False
+            self.log("FairValueGap strategy stopped.")
 
 #---- Run the app ----
 if __name__ == "__main__":

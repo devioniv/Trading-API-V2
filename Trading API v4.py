@@ -531,9 +531,9 @@ class TradingApp(QMainWindow):
             # The modern ib_async call is reqAccountUpdatesAsync.
             # We will only use this and not the sync fallback.
             if hasattr(self.ib, "reqAccountUpdatesAsync"):
-                res = self.ib.reqAccountUpdatesAsync(subscribe=True, acctCode="")
+                res = self.ib.reqAccountUpdatesAsync("")
                 self.add_task(res)
-                traces.append("Called reqAccountUpdatesAsync(subscribe=True, acctCode='')")
+                traces.append("Called reqAccountUpdatesAsync('')")
             else:
                 traces.append("reqAccountUpdatesAsync not found.")
         except Exception as e:
@@ -1337,6 +1337,7 @@ class WmaRmaMacdStrategy(BaseStrategy):
                     if df is None or len(df) < self.min_bars:
                         continue
                     self.calculate_indicators(df)
+                    self.app.data[self.symbol] = df
                     sig = self.check_conditions(df)
                     if sig:
                         await self._handle_entry(sig)
@@ -1397,6 +1398,7 @@ class TrendlineBreakoutStrategy(BaseStrategy):
                     if df is None:
                         continue
                     self.calculate_indicators(df)
+                    self.app.data[self.symbol] = df
                     sig = self.check_conditions(df)
                     if sig:
                         await self._handle_entry(sig)
@@ -1453,6 +1455,7 @@ class SupportResistanceStrategy(BaseStrategy):
                     if df is None:
                         continue
                     self.calculate_indicators(df)
+                    self.app.data[self.symbol] = df
                     sig = self.check_conditions(df)
                     if sig:
                         await self._handle_entry(sig)

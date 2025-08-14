@@ -564,18 +564,10 @@ class TradingApp(QMainWindow):
                     traces.append(f"inspect or call error: {e}")
             if not success and hasattr(self.ib, "reqAccountUpdates"):
                 try:
-                    # sync fallback (may expect (subscribe, acctCode) or (subscribe, acctCode, modelCode))
-                    try:
-                        self.ib.reqAccountUpdates(True, "")
-                        traces.append("Called sync reqAccountUpdates(True, '')")
-                    except TypeError:
-                        try:
-                            self.ib.reqAccountUpdates(True, "", "")
-                            traces.append("Called sync reqAccountUpdates(True, '', '')")
-                        except Exception as e:
-                            traces.append(f"sync reqAccountUpdates error: {e}")
+                    self.ib.reqAccountUpdates("")
+                    traces.append("Called sync reqAccountUpdates('')")
                 except Exception as e:
-                    traces.append(f"sync fallback final error: {e}")
+                    traces.append(f"sync reqAccountUpdates error: {e}")
         except Exception as e:
             traces.append(f"outer error: {e}")
 
@@ -1141,10 +1133,15 @@ class BaseStrategy:
             sec_type = self.contract.get("secType", "STK").upper()
             if sec_type == "STK":
                 ib_contract = Stock(self.symbol, 'SMART', 'USD')
+                qty = int(qty)
             elif sec_type == "CASH":
                 ib_contract = Forex(self.symbol)
             else:
                 self.log(f"Unsupported secType for placing order: {sec_type}")
+                return None
+
+            if qty == 0:
+                self.log(f"Order for {self.symbol} has quantity 0. Skipping.")
                 return None
 
             if order_type.upper() == "MKT":
@@ -1328,17 +1325,9 @@ class WmaRmaMacdStrategy(BaseStrategy):
         self.macd_signal = int(self.params.get("macd_signal", 7))
 
     def calculate_indicators(self, df: pd.DataFrame):
-        try:
-            df.ta.wma(length=self.wma_fast, append=True, col_names=(f'WMA_{self.wma_fast}',))
-            df.ta.rma(length=self.rma_slow, append=True, col_names=(f'RMA_{self.rma_slow}',))
-        except Exception as e:
-            self.log(f"Indicator calculation error: {e}")
-            pass
-        try:
-            df.ta.macd(fast=self.macd_fast, slow=self.macd_slow, signal=self.macd_signal, append=True)
-        except Exception as e:
-            self.log(f"MACD calculation error: {e}")
-            pass
+        df.ta.wma(length=self.wma_fast, append=True, col_names=(f'WMA_{self.wma_fast}',))
+        df.ta.rma(length=self.rma_slow, append=True, col_names=(f'RMA_{self.rma_slow}',))
+        df.ta.macd(fast=self.macd_fast, slow=self.macd_slow, signal=self.macd_signal, append=True)
         normalize_ta_columns(df)
 
     def check_conditions(self, df: pd.DataFrame) -> Optional[str]:

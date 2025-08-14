@@ -528,48 +528,16 @@ class TradingApp(QMainWindow):
         traces = []
         success = False
         try:
+            # The modern ib_async call is reqAccountUpdatesAsync.
+            # We will only use this and not the sync fallback.
             if hasattr(self.ib, "reqAccountUpdatesAsync"):
-                func = getattr(self.ib, "reqAccountUpdatesAsync")
-                try:
-                    sig = inspect.signature(func)
-                    params = list(sig.parameters.keys())
-                    # common possibilities: ("subscribe","acctCode") or ("acctCode",) or ("accountCode",)
-                    if "subscribe" in params or "acctCode" in params or "accountCode" in params:
-                        # try keyword call first
-                        try:
-                            if "subscribe" in params and "acctCode" in params:
-                                res = func(subscribe=True, acctCode="")
-                                traces.append("Called reqAccountUpdatesAsync(subscribe=True, acctCode='')")
-                            elif "accountCode" in params:
-                                res = func("")
-                                traces.append("Called reqAccountUpdatesAsync('')  # accountCode signature")
-                            else:
-                                # fallback positional
-                                res = func(True, "")
-                                traces.append("Called reqAccountUpdatesAsync(True, '') fallback")
-                        except TypeError as te:
-                            traces.append(f"TypeError while calling reqAccountUpdatesAsync: {te}")
-                            # fallback try positional
-                            try:
-                                res = func(True, "")
-                                traces.append("Called reqAccountUpdatesAsync(True, '') fallback2")
-                            except Exception as e:
-                                traces.append(f"Second fallback exception: {e}")
-                                res = None
-                        if res is not None:
-                            if asyncio.iscoroutine(res):
-                                self.add_task(res)
-                            success = True
-                except Exception as e:
-                    traces.append(f"inspect or call error: {e}")
-            if not success and hasattr(self.ib, "reqAccountUpdates"):
-                try:
-                    self.ib.reqAccountUpdates("")
-                    traces.append("Called sync reqAccountUpdates('')")
-                except Exception as e:
-                    traces.append(f"sync reqAccountUpdates error: {e}")
+                res = self.ib.reqAccountUpdatesAsync(subscribe=True, acctCode="")
+                self.add_task(res)
+                traces.append("Called reqAccountUpdatesAsync(subscribe=True, acctCode='')")
+            else:
+                traces.append("reqAccountUpdatesAsync not found.")
         except Exception as e:
-            traces.append(f"outer error: {e}")
+            traces.append(f"reqAccountUpdatesAsync error: {e}")
 
         self.log(f"on_connected reqAccountUpdates attempts: {traces}")
 
@@ -1131,11 +1099,16 @@ class BaseStrategy:
                 return None
 
             sec_type = self.contract.get("secType", "STK").upper()
+            qty = int(qty) # All orders must be integer quantities
+
             if sec_type == "STK":
                 ib_contract = Stock(self.symbol, 'SMART', 'USD')
-                qty = int(qty)
+                if limit_price: limit_price = round(limit_price, 2)
+                if stop_price: stop_price = round(stop_price, 2)
             elif sec_type == "CASH":
                 ib_contract = Forex(self.symbol)
+                if limit_price: limit_price = round(limit_price, 5)
+                if stop_price: stop_price = round(stop_price, 5)
             else:
                 self.log(f"Unsupported secType for placing order: {sec_type}")
                 return None
@@ -1169,10 +1142,7 @@ class BaseStrategy:
 
     def get_dataframe(self) -> Optional[pd.DataFrame]:
         try:
-            maybe = self.app.data.get(self.symbol)
-            if maybe is None: return None
-            if isinstance(maybe, pd.DataFrame): return maybe.copy()
-            return pd.DataFrame(maybe)
+            return self.app.data.get(self.symbol)
         except Exception as e:
             self.log(f"get_dataframe error: {e}")
             return None
